@@ -49,6 +49,9 @@ func (a *app) songItems(tr *qqmusic.Track, pid int64) func(m *ui.Menu) {
 			a.pl.PlayNext(*tr)
 			a.toast = "已设为下一首播放"
 		}
+		if a.together.joined && m.Item("点歌到房间").Disabled(!tr.Playable()).Chosen() {
+			a.togetherRequestSong(*tr)
+		}
 		m.Separator()
 		if m.Item("复制歌名").Chosen() {
 			copyText(tr.Name)

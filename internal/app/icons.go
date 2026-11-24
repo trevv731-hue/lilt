@@ -67,4 +67,7 @@ var (
 	iconSignOut  = strokeIcon(`<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>`)
 	iconGrid     = strokeIcon(`<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>`)
 	iconInfo     = strokeIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 16v-4"/><path d="M12 8h.01"/>`)
+	iconTogether = strokeIcon(`<circle cx="9" cy="8" r="3.5"/><path d="M2.5 21a6.5 6.5 0 0 1 13 0"/><circle cx="17.5" cy="10" r="2.8"/><path d="M15.7 15.5a5.6 5.6 0 0 1 5.8 5.5"/>`)
+	iconCopy     = strokeIcon(`<rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>`)
+	iconSend     = fillIcon(`<path d="M3.4 20.6 21 12 3.4 3.4l.1 6.9L15 12 3.5 13.7z"/>`)
 )

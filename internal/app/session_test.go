@@ -38,6 +38,73 @@ func TestSessionWriterKeepsLatestSnapshot(t *testing.T) {
 	}
 }
 
+func TestSuspendMainWindowSavesSession(t *testing.T) {
+	dir := t.TempDir()
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	defer mygo.App.SetPath(mygo.PathUserData, "")
+
+	a := newTestApp()
+	a.pl.Cue([]qqmusic.Track{{ID: 7, Name: "one", Duration: 200_000}})
+	a.suspendMainWindow()
+	a.sessionWrites.wait()
+
+	b, err := os.ReadFile(filepath.Join(dir, "session.json"))
+	if err != nil {
+		t.Fatalf("hiding the window did not save: %v", err)
+	}
+	var saved player.Session
+	if err := json.Unmarshal(b, &saved); err != nil || len(saved.Queue) != 1 || saved.Queue[0].ID != 7 {
+		t.Fatalf("unexpected session: %+v (%v)", saved, err)
+	}
+}
+
+func TestRestoreSessionFallsBackToBackup(t *testing.T) {
+	dir := t.TempDir()
+	mygo.App.SetPath(mygo.PathUserData, dir)
+	defer mygo.App.SetPath(mygo.PathUserData, "")
+	path := filepath.Join(dir, "session.json")
+	backup := `{"queue":[],"order":[],"at":-1,"position":0}`
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".bak", []byte(backup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newTestApp()
+	a.restoreSession()
+	a.sessionWrites.mu.Lock()
+	saved := a.sessionWrites.saved
+	a.sessionWrites.mu.Unlock()
+	if saved != backup {
+		t.Fatalf("restored %q, want the backup", saved)
+	}
+}
+
+func TestSessionWriterKeepsPreviousSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	var w sessionWriter
+	<-w.submit(path, player.Session{At: 1, Position: 1000})
+	<-w.submit(path, player.Session{At: 2, Position: 2000})
+
+	b, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("no previous session kept: %v", err)
+	}
+	var backup player.Session
+	if err := json.Unmarshal(b, &backup); err != nil || backup.At != 1 {
+		t.Fatalf("unexpected backup: %+v (%v)", backup, err)
+	}
+	b, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current player.Session
+	if err := json.Unmarshal(b, &current); err != nil || current.At != 2 {
+		t.Fatalf("unexpected session: %+v (%v)", current, err)
+	}
+}
+
 func TestSessionWriterRetriesFailedSave(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
 	path := filepath.Join(dir, "session.json")

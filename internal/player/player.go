@@ -44,6 +44,17 @@ type Player struct {
 	// Changed, if set, hears that what plays, where it is or whether it
 	// plays changed.
 	Changed func()
+	// LockControls, if set, reports that the listener may not choose what
+	// plays: the room's host keeps the queue. Transport stays usable.
+	LockControls func() bool
+	// OnPlayPause and OnSeek, if set, hear the listener's own transport
+	// actions before they run.
+	OnPlayPause func()
+	OnSeek      func()
+	// RequestNext and RequestPrev, if set, may take the action elsewhere:
+	// returning true stops this player from advancing.
+	RequestNext func() bool
+	RequestPrev func() bool
 
 	queue   []qqmusic.Track
 	order   []int // the queue's indices in play order: shuffled or not
@@ -141,6 +152,8 @@ func (p *Player) announce(t *qqmusic.Track, artwork []byte) {
 	})
 }
 
+func (p *Player) locked() bool { return p.LockControls != nil && p.LockControls() }
+
 func (p *Player) ended() {
 	if p.repeat == RepeatOne {
 		p.out.Seek(0)
@@ -156,11 +169,14 @@ func (p *Player) ended() {
 		p.sync()
 		return
 	}
-	p.Next()
+	p.next()
 }
 
 // PlayQueue replaces the queue with tracks and plays the one at start.
 func (p *Player) PlayQueue(tracks []qqmusic.Track, start int) {
+	if p.locked() {
+		return
+	}
 	if len(tracks) == 0 {
 		return
 	}
@@ -182,6 +198,9 @@ func (p *Player) PlayQueue(tracks []qqmusic.Track, start int) {
 // PlayNext inserts t after the current track in play order without changing
 // playback. With nothing playing, it queues t for when playback starts.
 func (p *Player) PlayNext(t qqmusic.Track) {
+	if p.locked() {
+		return
+	}
 	i := len(p.queue)
 	p.queue = append(p.queue, t)
 	// A menu can insert while the queue view is being built. Keep its copy
@@ -193,6 +212,9 @@ func (p *Player) PlayNext(t qqmusic.Track) {
 // Remove deletes the queue's track i without mutating previously returned
 // slices so an in-progress queue build finishes cleanly.
 func (p *Player) Remove(i int) {
+	if p.locked() {
+		return
+	}
 	if i < 0 || i >= len(p.queue) {
 		return
 	}
@@ -255,6 +277,9 @@ func (p *Player) Remove(i int) {
 // gives as the queue nears its end, until something else is played. The
 // radio's name says which it is. feed calls got on the main thread.
 func (p *Player) PlayRadio(name string, tracks []qqmusic.Track, feed func(got func([]qqmusic.Track))) {
+	if p.locked() {
+		return
+	}
 	if len(tracks) == 0 {
 		return
 	}
@@ -269,6 +294,9 @@ func (p *Player) PlayRadio(name string, tracks []qqmusic.Track, feed func(got fu
 // goes on with tracks, then with those feed gives: without starting it
 // over.
 func (p *Player) RadioFrom(name string, tracks []qqmusic.Track, feed func(got func([]qqmusic.Track))) {
+	if p.locked() {
+		return
+	}
 	if p.track == nil {
 		return
 	}
@@ -280,6 +308,9 @@ func (p *Player) RadioFrom(name string, tracks []qqmusic.Track, feed func(got fu
 // AttachRadio makes the queue the radio name's, which feed goes on with,
 // as after restoring a session that played it.
 func (p *Player) AttachRadio(name string, feed func(got func([]qqmusic.Track))) {
+	if p.locked() {
+		return
+	}
 	p.endRadio()
 	p.radio, p.feed = name, feed
 	p.refill()
@@ -413,6 +444,16 @@ func (p *Player) Ready() bool { return p.out != nil }
 // Err returns why the current track did not play, or "".
 func (p *Player) Err() string { return p.err }
 
+// StreamURL reports the stream the current track plays from: the room's host
+// shares it so guests need no membership of their own. Call it from the app
+// goroutine that owns the player.
+func (p *Player) StreamURL() (qqmusic.Stream, bool) {
+	if p.info == nil || p.info.URL == "" {
+		return qqmusic.Stream{}, false
+	}
+	return *p.info, true
+}
+
 // ClearErr clears a pending playback error, as when account recovery succeeds.
 func (p *Player) ClearErr() {
 	if p.err == "" {
@@ -474,6 +515,15 @@ func (p *Player) OpenAudio() (Audio, error) {
 func (p *Player) PlayOrder() ([]int, int) { return p.order, p.at }
 
 func (p *Player) Next() {
+	if p.RequestNext != nil && p.RequestNext() {
+		return
+	}
+	p.next()
+}
+
+// next plays the track after this one, whatever the controls allow: the
+// song ending is not the listener asking.
+func (p *Player) next() {
 	if len(p.order) == 0 {
 		return
 	}
@@ -493,6 +543,9 @@ func (p *Player) Next() {
 // once a few seconds in, going back to its start only kept the listener
 // pressing twice.
 func (p *Player) Prev() {
+	if p.RequestPrev != nil && p.RequestPrev() {
+		return
+	}
 	if len(p.order) == 0 {
 		return
 	}
@@ -505,6 +558,9 @@ func (p *Player) Prev() {
 
 // Jump plays the queue's track i.
 func (p *Player) Jump(i int) {
+	if p.locked() {
+		return
+	}
 	for k, v := range p.order {
 		if v == i {
 			p.load(k)
@@ -515,6 +571,9 @@ func (p *Player) Jump(i int) {
 
 // TogglePlay pauses, fading out, or plays, fading in.
 func (p *Player) TogglePlay() {
+	if p.OnPlayPause != nil {
+		p.OnPlayPause()
+	}
 	if p.out == nil {
 		switch {
 		case p.loading:
@@ -577,6 +636,9 @@ const seekGap = 30 * time.Millisecond
 // which the audio player fades over a few milliseconds, rather than
 // cutting from one sound to the other with a click.
 func (p *Player) Seek(t time.Duration) {
+	if p.OnSeek != nil {
+		p.OnSeek()
+	}
 	if p.out == nil {
 		p.pending = t
 		return
@@ -900,6 +962,14 @@ func (p *Player) open(t qqmusic.Track, level string, normalize bool) (*qqmusic.S
 	if !ok {
 		var err error
 		info, err = songURL(t.ID, level)
+		if err != nil && (errors.Is(err, qqmusic.ErrUnavailable) || errors.Is(err, qqmusic.ErrLoginRequired)) {
+			// Another member of the room may have resolved this track
+			// with their own account, membership included: the signed
+			// link plays for anyone holding it.
+			if shared, ok := waitSharedStream(t.ID, sharedWait); ok {
+				info, err = &shared, nil
+			}
+		}
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -924,6 +994,10 @@ func (p *Player) open(t qqmusic.Track, level string, normalize bool) (*qqmusic.S
 	}
 	return info, s, loudness, nil
 }
+
+// sharedWait is how long a track this account may not play waits for
+// another member of the room to hand over the link they resolved.
+var sharedWait = 12 * time.Second
 
 var (
 	fetchCover   = qqmusic.Fetch

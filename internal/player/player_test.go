@@ -940,3 +940,58 @@ func TestRemoveQueueTracks(t *testing.T) {
 		}
 	})
 }
+
+// LockControls keeps a listener following a room from replacing the queue:
+// transport stays theirs to use.
+func TestLockControlsKeepsTheQueue(t *testing.T) {
+	p := New(func(func()) {})
+	p.Cue([]qqmusic.Track{{ID: 1, Name: "one"}, {ID: 2, Name: "two"}})
+	p.LockControls = func() bool { return true }
+
+	p.Jump(1)
+	p.PlayQueue([]qqmusic.Track{{ID: 9, Name: "nine"}}, 0)
+	p.PlayNext(qqmusic.Track{ID: 3, Name: "three"})
+	p.Remove(0)
+	p.PlayRadio("radio", nil, nil)
+	p.RadioFrom("radio", nil, nil)
+	p.AttachRadio("radio", nil)
+
+	if p.Current() == nil || p.Current().ID != 1 {
+		t.Fatalf("the track changed, now %+v", p.Current())
+	}
+	if q := p.Queue(); len(q) != 2 || q[0].ID != 1 {
+		t.Fatalf("the queue changed: %+v", q)
+	}
+}
+
+// TransportHooks let the room hear the listener's own controls, and let a
+// guest hand next and previous to the host.
+func TestTransportHooks(t *testing.T) {
+	empty := New(func(func()) {})
+	var played int
+	empty.OnPlayPause = func() { played++ }
+	empty.TogglePlay()
+	if played != 1 {
+		t.Fatalf("OnPlayPause heard %d toggles, want 1", played)
+	}
+
+	p := New(func(func()) {})
+	p.Cue([]qqmusic.Track{{ID: 1, Name: "one"}, {ID: 2, Name: "two"}})
+	var seeks int
+	p.OnSeek = func() { seeks++ }
+	p.RequestNext = func() bool { return true }
+	p.RequestPrev = func() bool { return true }
+
+	p.Next()
+	p.Prev()
+	if p.Current() == nil || p.Current().ID != 1 {
+		t.Fatalf("handled requests should not change the track, now %+v", p.Current())
+	}
+	p.Seek(5 * time.Second)
+	if seeks != 1 {
+		t.Fatalf("OnSeek heard %d seeks, want 1", seeks)
+	}
+	if got := p.Position(); got != 5*time.Second {
+		t.Fatalf("a seek with no stream should keep its place, got %v", got)
+	}
+}

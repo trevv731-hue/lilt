@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,9 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+
+	"lilt/internal/qqmusic"
+	"lilt/internal/together"
 )
 
 // With NM_SHOTS set to a directory, the app walks through its views and
@@ -22,6 +26,11 @@ func init() {
 		// The scenes change settings to measure them: keep the
 		// listener's own as they were.
 		a.settings.path = ""
+		if relay := os.Getenv("NM_TOGETHER_RELAY"); relay != "" {
+			// Point a scene at a local room server, without touching the
+			// listener's settings.
+			a.settings.TogetherRelay = relay
+		}
 		go func() {
 			shot := func(name string, w *mygo.Window) {
 				png, err := w.CapturePage()
@@ -214,6 +223,102 @@ func init() {
 				step(0, func() { a.pageState().scroll.ScrollTo(0, 100000, ui.Smooth) })
 				time.Sleep(2 * time.Second)
 				shot("p-follows", a.win)
+				mygo.RunOnMain(mygo.App.Quit)
+				return
+			}
+			if os.Getenv("NM_SCENE") == "together" {
+				// The room's entry, then a room with two listeners, a song,
+				// a request and a line of chat, for its layout.
+				const hostAvatar = "https://thirdqq.qlogo.cn/g?b=qq&nk=10001&s=160"
+				const guestAvatar = "https://thirdqq.qlogo.cn/g?b=qq&nk=10002&s=160"
+				time.Sleep(3 * time.Second)
+				step(0, func() {
+					a.profile = &qqmusic.Profile{Nickname: "小右", AvatarURL: hostAvatar}
+					a.open(route{page: pageTogether})
+				})
+				time.Sleep(2 * time.Second)
+				shot("t-entry", a.win)
+				step(0, func() {
+					a.together = togetherState{
+						joined:   true,
+						host:     true,
+						code:     "ABCD2345",
+						clientID: "host",
+						status:   together.StatusOnline,
+						members: []together.Member{
+							{Client: "host", Name: "小右", Avatar: hostAvatar, Host: true},
+							{Client: "guest", Name: "朋友", Avatar: guestAvatar},
+						},
+						playback: &together.Playback{
+							Track:      &together.Track{ID: 1, Name: "晴天", Artists: []together.Artist{{Name: "周杰伦"}}, Album: together.Album{Name: "叶惠美"}, Duration: 269_000},
+							Playing:    true,
+							PositionMs: 42_000,
+						},
+						pending: []together.Pending{
+							{ID: "p1", Track: together.Track{ID: 2, Name: "稻香", Artists: []together.Artist{{Name: "周杰伦"}}, Duration: 200_000}, By: "guest", ByName: "朋友"},
+						},
+						chat: []together.Chat{
+							{ID: "c1", Client: "guest", Name: "朋友", Avatar: guestAvatar, Text: "这首好听", At: 1_700_000_000_000},
+							{ID: "c2", Client: "host", Name: "小右", Avatar: hostAvatar, Text: "下一首放你点的", At: 1_700_000_060_000},
+						},
+					}
+					a.together.chatList.FollowEnd = true
+				})
+				time.Sleep(2 * time.Second)
+				shot("t-room", a.win)
+				step(0, func() { a.pageState().scroll.ScrollTo(0, 100000, ui.Smooth) })
+				time.Sleep(2 * time.Second)
+				shot("t-chat", a.win)
+				mygo.RunOnMain(mygo.App.Quit)
+				return
+			}
+			if os.Getenv("NM_SCENE") == "together-live" {
+				// Creates a real room on the relay and stays in it, so a probe
+				// can join as a guest and hear the host publish.
+				time.Sleep(3 * time.Second)
+				step(0, func() { a.open(route{page: pageTogether}) })
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					room, err := together.CreateRoom(ctx, a.togetherRelay(), together.DefaultHTTPClient())
+					if err != nil {
+						println("TOGETHER_ERROR", err.Error())
+						return
+					}
+					println("TOGETHER_ROOM", room.Code)
+					a.post(func() { a.togetherConnect(room.Code, room.HostKey) })
+				}()
+				time.Sleep(22 * time.Second)
+				shot("t-live", a.win)
+				mygo.RunOnMain(mygo.App.Quit)
+				return
+			}
+			if os.Getenv("NM_SCENE") == "together-guest" {
+				// Joins a room a probe hosts, for the guest's side: what it
+				// loads, whether its account may play it, and how it looks.
+				room := os.Getenv("NM_ROOM")
+				if room == "" {
+					println("TOGETHER_ERROR missing NM_ROOM")
+					mygo.RunOnMain(mygo.App.Quit)
+					return
+				}
+				time.Sleep(3 * time.Second)
+				step(0, func() {
+					a.open(route{page: pageTogether})
+					a.togetherConnect(room, "")
+				})
+				time.Sleep(15 * time.Second)
+				step(0, func() {
+					if cur := a.pl.Current(); cur != nil {
+						println("GUEST_TRACK", cur.ID, cur.Name)
+					}
+					println("GUEST_TRACKS", len(a.pl.Queue()))
+					println("GUEST_ERR", a.pl.Err())
+					println("GUEST_PLAYING", a.pl.Playing())
+					println("GUEST_JOINED", a.together.joined, a.together.host, len(a.together.members))
+				})
+				time.Sleep(2 * time.Second)
+				shot("t-guest", a.win)
 				mygo.RunOnMain(mygo.App.Quit)
 				return
 			}

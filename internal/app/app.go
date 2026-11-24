@@ -29,6 +29,7 @@ const (
 	pageSettings
 	pageSongShelf
 	pageSquare
+	pageTogether
 )
 
 type route struct {
@@ -102,6 +103,7 @@ type app struct {
 	daily       []qqmusic.Track
 	dailySpin   spinState // the record on the daily card
 	dailyBars   barState  // the bars on its play button
+	togetherSpin spinState // the record in a room
 	featured    []qqmusic.Playlist
 	charts      []qqmusic.Playlist
 	homeErr     string
@@ -200,6 +202,7 @@ type app struct {
 	captions              captionState  // the episode playing's captions, and the model that writes them
 	sig                   playerSig
 	quitting              bool
+	together              togetherState
 
 	settings                      settings
 	settingsWin                   *mygo.Window
@@ -259,6 +262,7 @@ var invalidateWindow = (*mygo.Window).Invalidate
 
 // Remember following before a hidden window can discard its scroll layout.
 func (a *app) suspendMainWindow() {
+	a.saveSession()
 	if !a.lyricBrowse {
 		a.lyricResume = true
 	}
@@ -287,6 +291,15 @@ func (a *app) playerChanged() {
 	}
 	a.keepSession()
 	a.syncCaptions()
+	if a.together.joined && !a.together.applying {
+		switch {
+		case a.together.host:
+			a.togetherPublish(true)
+		case a.together.userActed:
+			a.together.userActed = false
+			a.togetherPublish(true)
+		}
+	}
 	a.redraw()
 }
 
@@ -349,6 +362,11 @@ func Run() error {
 		a.art.disk = a.pl.Cache
 		a.cacheMoving = a.settings.PendingCacheDir != nil
 		a.pl.Changed = a.playerChanged
+		a.pl.LockControls = a.togetherControlsLocked
+		a.pl.OnPlayPause = a.togetherPlayPause
+		a.pl.OnSeek = a.togetherSeek
+		a.pl.RequestNext = a.togetherNextRequest
+		a.pl.RequestPrev = a.togetherPrevRequest
 		a.volume = a.settings.Volume
 		a.pl.SetVolume(a.volume)
 		vibrancy := a.settings.sidebarVibrancy()
@@ -418,6 +436,7 @@ func Run() error {
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		a.quitting = true
+		a.togetherExit()
 		if a.desktopLyrics != nil {
 			a.desktopLyrics.destroy()
 		}

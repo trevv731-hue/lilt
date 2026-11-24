@@ -132,6 +132,9 @@ func (a *app) signedIn(prof *qqmusic.Profile) {
 	a.square = squareState{gen: a.square.gen + 1}
 	a.load(a.route)
 	a.loadHome()
+	// A room joined before the session restored shows the account's name
+	// from now on, not the placeholder it had.
+	a.togetherSyncIdentity()
 	if prof == nil {
 		return
 	}

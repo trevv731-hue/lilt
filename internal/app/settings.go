@@ -103,6 +103,13 @@ type settings struct {
 	PendingCacheDir *string `json:"pendingCacheDir,omitempty"`
 	// SearchHistory keeps submitted keywords, most recent first.
 	SearchHistory []string `json:"searchHistory,omitempty"`
+	// TogetherName is the nickname shown in a room, and kept for the next.
+	TogetherName string `json:"togetherName,omitempty"`
+	// TogetherRelay overrides the room server; empty uses the built-in one.
+	TogetherRelay string `json:"togetherRelay,omitempty"`
+	// TogetherClient identifies this install in a room, so reconnecting
+	// replaces its old connection instead of showing a second member.
+	TogetherClient string `json:"togetherClient,omitempty"`
 
 	path string // where they were loaded from, and are saved to
 }

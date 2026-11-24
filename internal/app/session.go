@@ -92,7 +92,15 @@ func (w *sessionWriter) run() {
 		if err != nil || string(b) == saved {
 			continue
 		}
-		if os.WriteFile(job.path+".part", b, 0o600) != nil || os.Rename(job.path+".part", job.path) != nil {
+		if os.WriteFile(job.path+".part", b, 0o600) != nil {
+			continue
+		}
+		// Keep the session before this one, so a corrupt or foreign write
+		// does not lose the queue outright.
+		if old, err := os.ReadFile(job.path); err == nil && len(old) > 0 {
+			_ = os.WriteFile(job.path+".bak", old, 0o600)
+		}
+		if os.Rename(job.path+".part", job.path) != nil {
 			continue
 		}
 		w.mu.Lock()
@@ -139,12 +147,14 @@ func (a *app) restoreSession() {
 		return
 	}
 	b, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
 	var s player.Session
-	if json.Unmarshal(b, &s) != nil {
-		return
+	if err != nil || json.Unmarshal(b, &s) != nil {
+		// The last session is kept beside it; a corrupt or foreign write
+		// should not lose the queue.
+		b, err = os.ReadFile(path + ".bak")
+		if err != nil || json.Unmarshal(b, &s) != nil {
+			return
+		}
 	}
 	a.sessionWrites.mu.Lock()
 	a.sessionWrites.saved = string(b)
