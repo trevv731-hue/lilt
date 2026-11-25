@@ -433,6 +433,16 @@ func (a *app) togetherTrackInfo(c *ui.Context) {
 			return
 		}
 		tr := qqmusicTrack(*pb.Track)
+		if pb.Playing && len(st.members) > 1 {
+			// QQ 音乐 labels its room 「我们正在一起听」 while two people are
+			// in a song. It is a state, not a notice: it sits above the
+			// title the way the app puts it, and says nothing when the
+			// room is only one listener or is paused.
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Box(c).Size(5, 5).Radius(3).Background(p.accent)
+				ui.Text(c, "我们正在一起听").FontSize(11).FontWeight(700).LetterSpacing(0.4).TextColor(p.accent)
+			})
+		}
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, tr.Name).FontSize(26).FontWeight(750).LetterSpacing(-0.6).MaxLines(2)
 			if pb.Track.Fee == 1 {
