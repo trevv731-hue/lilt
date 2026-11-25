@@ -24,6 +24,9 @@ type palette struct {
 	accent    ui.Color
 	onAccent  ui.Color
 	cardShade ui.Color
+	// warn marks a line the page adds when something did not work: the
+	// room says it in its own text instead of a popup over the window.
+	warn ui.Color
 }
 
 func paletteFor(t *ui.Theme) palette {
@@ -44,6 +47,7 @@ func paletteFor(t *ui.Theme) palette {
 		accent:    radixGreen(t.Dark, 9),
 		onAccent:  radixPaper,
 		cardShade: shade,
+		warn:      radixAmber(t.Dark, 11),
 	}
 }
 

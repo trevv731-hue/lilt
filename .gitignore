@@ -22,3 +22,6 @@ RELEASING.md
 
 # Design screenshots from NM_SHOTS
 /shots/
+
+# Build output of cmd/together-probe
+/together-probe.exe

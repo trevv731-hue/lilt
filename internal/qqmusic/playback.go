@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"lilt/internal/lyrics"
@@ -155,7 +156,17 @@ func SongURL(id int64, level string) (*Stream, error) {
 					size = actualSize
 				}
 			}
+			if t.NeedsRights() && detectTrial.Load() {
+				// QQ reports the song's full size even when it serves a
+				// trial to an account without the rights, so ask the CDN
+				// how large the file really is: that is what tells a full
+				// song from thirty seconds of one.
+				if actual := ProbeStreamSize(streamURL); actual > 0 {
+					size = actual
+				}
+			}
 			stream := &Stream{URL: streamURL, Type: q.extension, Level: q.level, Size: size}
+			stream.Trial = t.TrialLike(*stream)
 			if t.Volume != nil {
 				stream.Gain, stream.Peak = t.Volume.Gain, t.Volume.Peak
 			}
@@ -163,6 +174,62 @@ func SongURL(id int64, level string) (*Stream, error) {
 		}
 	}
 	return nil, ErrUnavailable
+}
+
+// ProbeStreamSize asks a music CDN how many bytes a signed link really
+// holds. A trial is cut short while the API still reports the full size, so
+// the file's own answer is the only reliable one. A CDN that ignores ranges
+// answers with the whole length, and anything else leaves the size unknown.
+// detectTrial turns the extra look at the CDN on: a room needs to know
+// whether a member's link is the song or the thirty seconds QQ gives an
+// account without the rights, while ordinary playback does not.
+var detectTrial atomic.Bool
+
+// DetectTrial turns that look on or off.
+func DetectTrial(on bool) { detectTrial.Store(on) }
+
+func ProbeStreamSize(rawURL string) int64 {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Range", "bytes=0-1")
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		// A CDN that wants the request to look like QQ Music's player, as
+		// the download's own retry does.
+		res.Body.Close()
+		req.Header.Set("Referer", "https://y.qq.com/")
+		req.Header.Set("Origin", "https://y.qq.com")
+		if res, err = httpClient.Do(req); err != nil {
+			return 0
+		}
+	}
+	res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusPartialContent:
+		return contentRangeTotal(res.Header.Get("Content-Range"))
+	case http.StatusOK:
+		return res.ContentLength
+	}
+	return 0
+}
+
+// contentRangeTotal reads the whole length out of "bytes 0-1/12345".
+func contentRangeTotal(value string) int64 {
+	_, total, ok := strings.Cut(value, "/")
+	if !ok || total == "*" {
+		return 0
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func validStreamDomain(raw string) bool {

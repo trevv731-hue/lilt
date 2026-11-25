@@ -35,6 +35,15 @@ const (
 	statusBye      = websocket.StatusCode(4005)
 )
 
+// The room's heartbeat: the server sweeps a member it has not heard from in
+// a minute, so the beat it asks for is bounded here too. QQ 音乐 carries the
+// same number in its room as heartBeatInterval.
+const (
+	DefaultHeartbeat = 15 * time.Second
+	MinHeartbeat     = 5 * time.Second
+	MaxHeartbeat     = 30 * time.Second
+)
+
 type Status int
 
 const (
@@ -67,7 +76,12 @@ const (
 	EventStreamRequest = "stream_request"
 	// EventPlay is a member starting a requested song: the host's queue
 	// takes it, and its anchor carries everyone else.
-	EventPlay       = "play"
+	EventPlay   = "play"
+	EventStream = "stream"
+	EventQueue  = "queue"
+	// EventYou says whether the room is this member's to hold now, as after
+	// the host hands it over.
+	EventYou         = "you"
 	EventServerError = "server_error"
 )
 
@@ -87,6 +101,12 @@ type Event struct {
 	TrackID int64
 	// Track is the song another member asked to play from the desk.
 	Track *Track
+	// Stream is a link another member resolved for the room's track.
+	Stream *Stream
+	// Queue is the host's queue, as the host last mirrored it.
+	Queue *Queue
+	// You says whether this member holds the room now.
+	You *You
 	// Code is the server's error code, such as not_host or room_full.
 	Code string
 }
@@ -125,6 +145,12 @@ type Client struct {
 	clockAt  time.Time
 	pings    map[int64]time.Time
 	pingSeq  int64
+	// heartbeat is how often this member pings the room, and lastPing is
+	// when it last did. The room sets the beat (QQ 音乐's
+	// heartBeatInterval); until it does, fifteen seconds is the default
+	// the server also sweeps on.
+	heartbeat time.Duration
+	lastPing  time.Time
 }
 
 func DefaultHTTPClient() *http.Client {
@@ -145,6 +171,9 @@ func New(opts Options) *Client {
 // failed: the relay can be cold, and its Durable Object may refuse the
 // first initialisation.
 func CreateRoom(ctx context.Context, relay string, hc *http.Client) (CreatedRoom, error) {
+	if err := ValidateRelay(relay); err != nil {
+		return CreatedRoom{}, err
+	}
 	base, err := httpBase(relay)
 	if err != nil {
 		return CreatedRoom{}, err
@@ -237,7 +266,13 @@ func (c *Client) Run(ctx context.Context) {
 			return
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		conn, res, err := websocket.Dial(dialCtx, raw, &websocket.DialOptions{HTTPClient: c.http})
+		opts := &websocket.DialOptions{HTTPClient: c.http}
+		if c.opts.HostKey != "" {
+			// The key stays out of the URL: a query string is the part of a
+			// handshake proxies and logs are most likely to keep.
+			opts.HTTPHeader = http.Header{"X-Lilt-Host-Key": {c.opts.HostKey}}
+		}
+		conn, res, err := websocket.Dial(dialCtx, raw, opts)
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -324,6 +359,32 @@ func (c *Client) SetProfile(name, avatar string) error {
 // the link answers with the host's own hint.
 func (c *Client) RequestStream(trackID int64) error {
 	return c.send(wire{T: "stream.request", ID: trackID})
+}
+
+// ShareStream gives the room a signed link this account resolved, so a
+// member whose account may not play the track can still listen.
+func (c *Client) ShareStream(s Stream) error {
+	if s.TrackID <= 0 || s.URL == "" {
+		return nil
+	}
+	return c.send(wire{T: "stream", Stream: &s})
+}
+
+// PublishQueue mirrors the host's queue to the room, so a guest's client
+// shows and plays the same list rather than one borrowed track.
+func (c *Client) PublishQueue(q Queue) error {
+	if len(q.Tracks) == 0 {
+		return nil
+	}
+	return c.send(wire{T: "queue", Queue: &q})
+}
+
+// Transfer hands the room to another member; only the host may.
+func (c *Client) Transfer(client string) error {
+	if client == "" {
+		return nil
+	}
+	return c.send(wire{T: "transfer", Text: client})
 }
 
 func (c *Client) AddPending(t Track) error {
@@ -443,12 +504,28 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 				Playback:   msg.Playback,
 				Pending:    msg.Pending,
 				Chat:       msg.Chat,
+				Stream:     msg.Stream,
+				Streams:    msg.Streams,
+				Queue:      msg.Queue,
 				Features:   msg.Features,
 			}
 			if msg.You != nil {
 				w.You = *msg.You
 			}
 			c.emit(Event{Kind: EventWelcome, Welcome: w})
+		case "you":
+			if msg.You != nil {
+				you := *msg.You
+				c.emit(Event{Kind: EventYou, You: &you})
+			}
+		case "stream":
+			if msg.Stream != nil {
+				c.emit(Event{Kind: EventStream, Stream: msg.Stream})
+			}
+		case "queue":
+			if msg.Queue != nil {
+				c.emit(Event{Kind: EventQueue, Queue: msg.Queue})
+			}
 		case "members":
 			c.emit(Event{Kind: EventMembers, Members: msg.Members})
 		case "playback":
@@ -478,23 +555,47 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 }
 
 func (c *Client) pingLoop(ctx context.Context, conn *websocket.Conn) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	// One second of granularity, so a room that asks for a slower or
+	// quicker beat is obeyed without rebuilding the connection.
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
 	c.sendPing()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-tick.C:
 			c.mu.Lock()
 			current := c.conn == conn
+			gap := c.heartbeat
+			last := c.lastPing
 			c.mu.Unlock()
 			if !current {
 				return
 			}
-			c.sendPing()
+			if gap <= 0 {
+				gap = DefaultHeartbeat
+			}
+			if now.Sub(last) >= gap {
+				c.sendPing()
+			}
 		}
 	}
+}
+
+// SetHeartbeat is the beat the room asks for: fast enough that a member
+// who closes the lid is noticed, slow enough not to be a chat every few
+// seconds.
+func (c *Client) SetHeartbeat(d time.Duration) {
+	if d < MinHeartbeat {
+		d = MinHeartbeat
+	}
+	if d > MaxHeartbeat {
+		d = MaxHeartbeat
+	}
+	c.mu.Lock()
+	c.heartbeat = d
+	c.mu.Unlock()
 }
 
 func (c *Client) sendPing() {
@@ -503,6 +604,7 @@ func (c *Client) sendPing() {
 	id := c.pingSeq
 	now := time.Now()
 	c.pings[id] = now
+	c.lastPing = now
 	c.mu.Unlock()
 	_ = c.send(wire{T: "ping", ID: id, T0: now.UnixMilli()})
 }
@@ -567,6 +669,9 @@ func (c *Client) emit(ev Event) {
 }
 
 func (c *Client) url() (string, error) {
+	if err := ValidateRelay(c.opts.Relay); err != nil {
+		return "", err
+	}
 	u, err := url.Parse(c.opts.Relay)
 	if err != nil {
 		return "", err
@@ -594,9 +699,7 @@ func (c *Client) url() (string, error) {
 	if c.opts.Avatar != "" {
 		q.Set("avatar", c.opts.Avatar)
 	}
-	if c.opts.HostKey != "" {
-		q.Set("hostKey", c.opts.HostKey)
-	}
+
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

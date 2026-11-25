@@ -417,4 +417,3 @@ func TestQueueRenameAndContextMenuRemove(t *testing.T) {
 		})
 	}
 }
-

@@ -269,6 +269,41 @@ func init() {
 				step(0, func() { a.pageState().scroll.ScrollTo(0, 100000, ui.Smooth) })
 				time.Sleep(2 * time.Second)
 				shot("t-chat", a.win)
+				// The host's queue, where the room's play mode lives.
+				step(0, func() {
+					a.together.deskTab = 1
+					a.together.queue = &together.Queue{
+						Index:   0,
+						Shuffle: true,
+						Tracks: []together.Track{
+							{ID: 1, Name: "晴天", Artists: []together.Artist{{Name: "周杰伦"}}, Duration: 269_000},
+							{ID: 2, Name: "稻香", Artists: []together.Artist{{Name: "周杰伦"}}, Duration: 200_000},
+							{ID: 3, Name: "七里香", Artists: []together.Artist{{Name: "周杰伦"}}, Duration: 299_000},
+						},
+					}
+					a.together.roomShuffle = true
+					a.pl.SetShuffle(true)
+				})
+				time.Sleep(2 * time.Second)
+				shot("t-queue", a.win)
+				step(0, func() { a.together.deskTab = 0 })
+				// What the room says about itself: a line on the page, with
+				// no popup anywhere over the song.
+				step(0, func() { a.togetherNote("已点歌：「稻香」") })
+				time.Sleep(time.Second)
+				shot("t-note", a.win)
+				step(0, func() { a.togetherWarn("网络断了，正在重连…") })
+				time.Sleep(time.Second)
+				shot("t-warn", a.win)
+				// And the card a room leaves behind, as QQ 音乐's end card.
+				step(0, func() {
+					a.together.heardFrom = time.Now().Add(-34 * time.Minute)
+					a.together.heard = []togetherHeard{{id: 1, name: "晴天"}, {id: 2, name: "稻香"}, {id: 3, name: "七里香"}}
+					a.togetherFinish("房主结束了房间")
+					a.togetherLeave(false)
+				})
+				time.Sleep(2 * time.Second)
+				shot("t-end", a.win)
 				mygo.RunOnMain(mygo.App.Quit)
 				return
 			}

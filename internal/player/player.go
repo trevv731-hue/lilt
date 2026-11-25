@@ -424,6 +424,15 @@ func (p *Player) ToggleShuffle() {
 	}
 }
 
+// SetShuffle puts the player in the mode a room plays in, so a guest holds
+// the queue in the same order the host does rather than its own.
+func (p *Player) SetShuffle(on bool) {
+	if p.shuffle == on {
+		return
+	}
+	p.ToggleShuffle()
+}
+
 func (p *Player) CycleRepeat() { p.repeat = (p.repeat + 1) % 3 }
 
 // Current returns the track playing or loading, or nil.
@@ -465,6 +474,10 @@ func (p *Player) ClearErr() {
 
 // Stream returns what the current track streams, once loaded, or nil.
 func (p *Player) Stream() *qqmusic.Stream { return p.info }
+
+// StreamTrial reports whether what plays is the short trial QQ hands an
+// account without the track's rights, not the song itself.
+func (p *Player) StreamTrial() bool { return p.info != nil && p.info.Trial }
 
 func (p *Player) Shuffle() bool      { return p.shuffle }
 func (p *Player) Repeat() RepeatMode { return p.repeat }
@@ -887,7 +900,9 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 					}
 				}
 				// Skip only per-track unplayable errors while actively trying to play.
-				if p.playing && unavailable && skipped+1 < len(p.order) {
+				// In a room the track is the room's, so a skip would only
+				// fight the anchor: stop and say why instead.
+				if p.playing && unavailable && !expectShared.Load() && skipped+1 < len(p.order) {
 					next := at + 1
 					if next >= len(p.order) {
 						next = 0
@@ -959,13 +974,37 @@ func (p *Player) open(t qqmusic.Track, level string, normalize bool) (*qqmusic.S
 		}()
 	}
 	dl, info, ok := p.Cache.lookup(t.ID, level)
+	if ok && t.TrialLike(*info) {
+		// A trial kept before must not stand in for the song: drop it and
+		// take the room's link, or the real one, instead.
+		dl.Close()
+		p.Cache.Drop(t.ID, info.Level, info.Type)
+		dl, info, ok = nil, nil, false
+	}
 	if !ok {
+		// Each account plays with the link it signed itself when it can:
+		// a room whose members all hold the rights then never plays one
+		// account's stream from two places, which is the shape QQ Music
+		// expects of two listeners. The room's link is the fallback for an
+		// account that may not sign this track at all.
 		var err error
 		info, err = songURL(t.ID, level)
-		if err != nil && (errors.Is(err, qqmusic.ErrUnavailable) || errors.Is(err, qqmusic.ErrLoginRequired)) {
-			// Another member of the room may have resolved this track
-			// with their own account, membership included: the signed
-			// link plays for anyone holding it.
+		switch {
+		case err == nil && info.Trial && expectShared.Load():
+			// The thirty seconds QQ gives an account without the rights are
+			// not the song: give the member who can sign the real link a
+			// moment. A room that settles for a trial would stop at thirty
+			// seconds while the other listener plays on, so without a full
+			// link it says it needs one and stays on the room's track.
+			if shared, ok := waitSharedStream(t.ID, trialWait); ok {
+				info = &shared
+			} else {
+				err = qqmusic.ErrUnavailable
+			}
+		case err != nil && (errors.Is(err, qqmusic.ErrUnavailable) || errors.Is(err, qqmusic.ErrLoginRequired)):
+			// Another member may have resolved this track with their own
+			// account, membership included: the signed link plays for
+			// anyone holding it.
 			if shared, ok := waitSharedStream(t.ID, sharedWait); ok {
 				info, err = &shared, nil
 			}
@@ -973,7 +1012,12 @@ func (p *Player) open(t qqmusic.Track, level string, normalize bool) (*qqmusic.S
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		dl = p.Cache.download(t.ID, info)
+		if info.Trial {
+			// A trial is not the song: play it, but never keep it as one.
+			dl = p.Cache.fetch(info)
+		} else {
+			dl = p.Cache.download(t.ID, info)
+		}
 	}
 	s, err := openStream(dl, t.Duration)
 	if err != nil {
@@ -998,6 +1042,10 @@ func (p *Player) open(t qqmusic.Track, level string, normalize bool) (*qqmusic.S
 // sharedWait is how long a track this account may not play waits for
 // another member of the room to hand over the link they resolved.
 var sharedWait = 12 * time.Second
+
+// trialWait is how long a trial waits for the room's full link: a member
+// who can sign shares it as soon as the room's anchor reaches them.
+var trialWait = 4 * time.Second
 
 var (
 	fetchCover   = qqmusic.Fetch

@@ -25,6 +25,7 @@ func togetherRoomApp() *app {
 		host:     true,
 		code:     "ABCD2345",
 		clientID: "host",
+		selfID:   "host",
 		status:   together.StatusOnline,
 		members:  []together.Member{{Client: "host", Name: "小右", Host: true}, {Client: "guest", Name: "朋友"}},
 		playback: &together.Playback{Track: &together.Track{ID: 1, Name: "晴天", Artists: []together.Artist{{Name: "周杰伦"}}, Album: together.Album{Name: "叶惠美"}, Duration: 269_000}, Playing: true, PositionMs: 42_000},
@@ -91,6 +92,7 @@ func TestTogetherPageShowsRoom(t *testing.T) {
 		host:      true,
 		code:      "ABCD2345",
 		clientID:  "host",
+		selfID:    "host",
 		status:    together.StatusOnline,
 		members:   []together.Member{{Client: "host", Name: "小右", Host: true}, {Client: "guest", Name: "朋友"}},
 		playback:  &together.Playback{Track: &together.Track{ID: 1, Name: "晴天", Artists: []together.Artist{{Name: "周杰伦"}}, Album: together.Album{Name: "叶惠美"}, Duration: 269_000}, Playing: true, PositionMs: 42_000},
@@ -113,8 +115,11 @@ func TestTogetherGuestKeepsQueueNotTransport(t *testing.T) {
 	if !a.togetherControlsLocked() {
 		t.Fatal("a guest's song choice should be locked")
 	}
-	if a.toast == "" {
+	if a.together.note == "" {
 		t.Fatal("locking should say why")
+	}
+	if a.toast != "" {
+		t.Fatalf("the room says it on its own line, not in a popup: toast = %q", a.toast)
 	}
 	a.together.applying = true
 	if a.togetherControlsLocked() {
@@ -288,5 +293,44 @@ func TestTogetherLocalNameIsNotShared(t *testing.T) {
 	}
 	if a.togetherLocalName() == "我" {
 		t.Fatal("a listener without an account should not be named 我")
+	}
+}
+
+// The room shows the host's queue, mirrored: the guest sees the same list
+// and which of it the room is playing.
+func TestTogetherRoomShowsHostQueue(t *testing.T) {
+	a := togetherRoomApp()
+	a.together.deskTab = 1
+	a.together.queue = &together.Queue{
+		Tracks: []together.Track{
+			{ID: 1, Name: "晴天", Artists: []together.Artist{{Name: "周杰伦"}}},
+			{ID: 2, Name: "稻香", Artists: []together.Artist{{Name: "周杰伦"}}},
+		},
+		Index: 0,
+	}
+	tt := ui.NewTester(a.view, 1180, 780)
+	tt.Frame()
+	for _, want := range []string{"队列", "稻香", "与房主同一个队列"} {
+		if !tt.HasText(want) {
+			t.Fatalf("the room's queue tab should show %q", want)
+		}
+	}
+}
+
+// The room says whether this client is where the room is.
+func TestTogetherRoomShowsSyncState(t *testing.T) {
+	a := togetherRoomApp()
+	a.together.client = together.New(together.Options{Relay: "ws://127.0.0.1:1", Code: "ABCD2345", ClientID: "guest"})
+	a.together.playback = &together.Playback{
+		Track:      a.together.playback.Track,
+		Playing:    false,
+		PositionMs: 0,
+		UpdatedAt:  time.Now().UnixMilli(),
+	}
+	a.pl.Cue([]qqmusic.Track{{ID: 1, Name: "晴天", Duration: 269_000}})
+	tt := ui.NewTester(a.view, 1180, 780)
+	tt.Frame()
+	if !tt.HasText("已同步") {
+		t.Fatal("a paused client at the room's position is in sync")
 	}
 }

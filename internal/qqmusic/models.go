@@ -158,6 +158,54 @@ type Stream struct {
 	Level string  `json:"level"`
 	Gain  float64 `json:"gain"`
 	Peak  float64 `json:"peak"`
+	// Trial marks the thirty seconds QQ serves an account without the
+	// rights a track needs: it plays, but it is not the song, and a room
+	// with a member who can sign the real one must not settle for it.
+	Trial bool `json:"trial,omitempty"`
+}
+
+// NeedsRights reports whether QQ keeps this track for members or buyers: an
+// account without that right gets at most a short trial of it.
+func (t Track) NeedsRights() bool { return t.Fee == 1 || t.Fee == 4 }
+
+// ExpectedBytes is about how large this track's audio is at level, from the
+// sizes QQ reported, or from its duration at 128 kbps when those are
+// missing. It is what tells a full song from a trial.
+func (t Track) ExpectedBytes(level string) int64 {
+	var size int64
+	switch level {
+	case "exhigh":
+		size = t.Size320
+	case "lossless":
+		size = t.SizeFLAC
+	case "hires":
+		size = t.SizeHiRes
+	}
+	if size <= 0 {
+		size = t.Size128
+	}
+	if size > 0 {
+		return size
+	}
+	if t.Duration > 0 {
+		return t.Duration * 16 // 128 kbps, in bytes per millisecond
+	}
+	return 0
+}
+
+// TrialLike reports whether s is the short trial QQ gives an account without
+// the track's rights: far smaller than the song it stands for.
+func (t Track) TrialLike(s Stream) bool {
+	if s.Size <= 0 || !t.NeedsRights() {
+		return false
+	}
+	expected := t.ExpectedBytes(s.Level)
+	if expected <= 0 {
+		return false
+	}
+	// A trial is about an eighth of the song; half is a margin wide enough
+	// to never take a full song for a trial.
+	return s.Size*2 < expected
 }
 
 var ErrUnavailable = errors.New("QQ 音乐未提供此歌曲的播放链接，可能需要登录或相应会员权限")

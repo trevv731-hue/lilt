@@ -114,6 +114,7 @@ func TestTogetherGuestControlsReachRoom(t *testing.T) {
 		joined:   true,
 		host:     false,
 		clientID: "guest",
+		selfID:   "guest",
 		status:   together.StatusOnline,
 		client:   client,
 		playback: &together.Playback{Track: &together.Track{ID: 1, Name: "one", Duration: 200_000}, Playing: true, PositionMs: 0, UpdatedAt: time.Now().UnixMilli()},

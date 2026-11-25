@@ -480,6 +480,27 @@ func (c *Cache) writeAsset(path string, data []byte) (string, bool) {
 	return path, true
 }
 
+// fetch fetches a stream that is not the song worth keeping, as the thirty
+// seconds QQ gives an account without the rights: it plays once and its file
+// goes when it closes.
+func (c *Cache) fetch(st *qqmusic.Stream) *download {
+	part, _ := temporaryDownloadFile()
+	return startDownload(st.URL, st.Size, part, nil, nil)
+}
+
+// Drop removes a kept song, as one that turned out to be a trial rather
+// than the song it claimed to be.
+func (c *Cache) Drop(id int64, level, kind string) {
+	if c == nil || level == "" {
+		return
+	}
+	key := filepath.Join(c.dir, cacheKey(id, level))
+	_ = os.Remove(key + ".json")
+	if kind != "" {
+		_ = os.Remove(key + "." + kind)
+	}
+}
+
 // download fetches the song of the stream st into a file, to keep once it
 // has all come in, or a temporary file if the cache would not keep it.
 // Memory is only the fallback when no file can be made or written.

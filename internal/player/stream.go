@@ -96,16 +96,21 @@ func (d *download) run(ctx context.Context, url string) {
 		d.cond.Broadcast()
 		d.mu.Unlock()
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	res, err := streamGet(ctx, url, false)
 	if err != nil {
 		finish(err)
 		return
 	}
-	req.Header.Set("User-Agent", qqmusic.UserAgent)
-	res, err := streamHTTP.Do(req)
-	if err != nil {
-		finish(err)
-		return
+	// A link another member signed can be refused by the CDN that serves
+	// it when the request does not look like QQ Music's own player: the
+	// referer is what it checks, so ask once more with it.
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		res.Body.Close()
+		res, err = streamGet(ctx, url, true)
+		if err != nil {
+			finish(err)
+			return
+		}
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
@@ -136,6 +141,22 @@ func (d *download) run(ctx context.Context, url string) {
 			return
 		}
 	}
+}
+
+// streamGet asks for a song's bytes as QQ Music's own player would.
+// referer marks the second ask, for a CDN that refuses the first.
+func streamGet(ctx context.Context, url string, referer bool) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", qqmusic.UserAgent)
+	if referer {
+		req.Header.Set("Referer", "https://y.qq.com/")
+		req.Header.Set("Origin", "https://y.qq.com")
+		req.Header.Set("Accept", "*/*")
+	}
+	return streamHTTP.Do(req)
 }
 
 // write adds b to what is in. Only run writes, so it reads the file and

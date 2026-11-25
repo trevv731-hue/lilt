@@ -55,6 +55,35 @@ type Chat struct {
 	Avatar string `json:"avatar,omitempty"`
 	Text   string `json:"text"`
 	At     int64  `json:"at"`
+	// System marks the room's own lines: who came, who left, who holds it.
+	System bool `json:"sys,omitempty"`
+}
+
+// Stream is a signed play link one member resolved for the room's track.
+// QQ Music signs it for the account that asked, but the link plays for
+// whoever holds it, so one membership covers the room.
+type Stream struct {
+	TrackID int64  `json:"trackId"`
+	URL     string `json:"url"`
+	Type    string `json:"type,omitempty"`
+	Size    int64  `json:"size,omitempty"`
+	Level   string `json:"level,omitempty"`
+	At      int64  `json:"at,omitempty"`
+	// By and ByName are the member whose account signed the link, as the
+	// server records them: the room shows whose membership it is playing.
+	By     string `json:"by,omitempty"`
+	ByName string `json:"byName,omitempty"`
+}
+
+// Queue is the host's queue, mirrored so a guest plays the same list.
+type Queue struct {
+	Tracks []Track `json:"tracks"`
+	Index  int     `json:"index"`
+	Rev    int64   `json:"rev,omitempty"`
+	// Shuffle is the room's play mode, as QQ 音乐 keeps playMode and
+	// songRandomIndex in the room rather than in one client: whoever holds
+	// the queue decides, and everyone sees the same mode.
+	Shuffle bool `json:"shuffle,omitempty"`
 }
 
 type Pending struct {
@@ -78,11 +107,24 @@ type Welcome struct {
 	Playback   *Playback `json:"playback"`
 	Pending    []Pending `json:"pending"`
 	Chat       []Chat    `json:"chat"`
+	// Stream is the link the room already holds for its track, so a member
+	// who joins late needs no one to answer.
+	Stream *Stream `json:"stream"`
+	// Streams are the links the room still holds for its recent tracks, so
+	// a member who seeks back or joins late needs no one to sign again.
+	Streams []Stream `json:"streams,omitempty"`
+	// Queue is the host's queue, as the room last heard it.
+	Queue *Queue `json:"queue"`
 	// Features are what this relay understands beyond the first protocol:
 	// profile updates, stream requests, and the desk playing through the
 	// host's queue. An older relay sends none, and the app falls back to
 	// what it did before.
 	Features []string `json:"features,omitempty"`
+	// HeartbeatMs is how often the room wants to hear from this member, as
+	// QQ 音乐 carries heartBeatInterval in the room: the server knows when
+	// it sweeps absent members, so it sets the beat. Zero on an older
+	// relay, and the client keeps its own.
+	HeartbeatMs int64 `json:"heartbeatMs,omitempty"`
 }
 
 // wire is one message either way; the server picks the fields it needs.
@@ -104,4 +146,7 @@ type wire struct {
 	Track      *Track    `json:"track,omitempty"`
 	Text       string    `json:"text,omitempty"`
 	Features   []string  `json:"features,omitempty"`
+	Stream     *Stream   `json:"stream,omitempty"`
+	Streams    []Stream  `json:"streams,omitempty"`
+	Queue      *Queue    `json:"queue,omitempty"`
 }

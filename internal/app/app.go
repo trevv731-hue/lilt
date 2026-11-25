@@ -100,17 +100,17 @@ type app struct {
 	// answered, and those asked about: see ui_like.go.
 	likedPrograms, askedPrograms map[int64]bool
 
-	daily       []qqmusic.Track
-	dailySpin   spinState // the record on the daily card
-	dailyBars   barState  // the bars on its play button
+	daily        []qqmusic.Track
+	dailySpin    spinState // the record on the daily card
+	dailyBars    barState  // the bars on its play button
 	togetherSpin spinState // the record in a room
-	featured    []qqmusic.Playlist
-	charts      []qqmusic.Playlist
-	homeErr     string
-	homeLoading bool
-	homeAt      time.Time // when what the home page shows was asked for
-	homeGen     int
-	square      squareState
+	featured     []qqmusic.Playlist
+	charts       []qqmusic.Playlist
+	homeErr      string
+	homeLoading  bool
+	homeAt       time.Time // when what the home page shows was asked for
+	homeGen      int
+	square       squareState
 
 	playlists       map[int64]*qqmusic.Playlist
 	playlistLRU     []int64
@@ -234,6 +234,35 @@ func (a *app) post(fn func()) {
 	})
 }
 
+// postAlways runs fn on the goroutine that owns the app, as post does, and
+// inline when there is no window yet: a room must still hear its host
+// during startup, and a test has no window to update.
+func (a *app) postAlways(fn func()) {
+	if a.postFn != nil {
+		a.postFn(fn)
+		return
+	}
+	if a.win == nil {
+		fn()
+		return
+	}
+	a.win.Update(func() {
+		fn()
+		a.redraw()
+	})
+}
+
+// redrawLater schedules one repaint at when, so a line that fades by itself
+// does not need a timer of its own in the view.
+func (a *app) redrawLater(when time.Time) {
+	d := time.Until(when)
+	if d <= 0 {
+		a.redraw()
+		return
+	}
+	time.AfterFunc(d, func() { a.post(func() { a.redraw() }) })
+}
+
 func (a *app) redraw() {
 	if a.win != nil {
 		invalidateWindow(a.win)
@@ -294,10 +323,14 @@ func (a *app) playerChanged() {
 	if a.together.joined && !a.together.applying {
 		switch {
 		case a.together.host:
-			a.togetherPublish(true)
+			// The room follows the host's player at once, not on a
+			// four-second beat: a pause or a seek is heard as it happens.
+			a.togetherPublishSoon()
 		case a.together.userActed:
+			// A drag of the progress bar is many seeks: the room hears the
+			// one the listener settles on, not each of them.
 			a.together.userActed = false
-			a.togetherPublish(true)
+			a.togetherPublishSoon()
 		}
 	}
 	a.redraw()
@@ -325,6 +358,9 @@ func (a *app) canHideOnClose() bool {
 
 // Run runs the app until it quits.
 func Run() error {
+	// A named profile is a second app: its own settings, login, cache and
+	// lock, so two accounts can listen together from one machine.
+	applyProfile()
 	// Starting the app again, as from its shortcut while it plays from the
 	// tray, hands the launch over to the instance already running, which
 	// opens its window again, instead of running a second app beside it.

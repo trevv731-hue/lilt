@@ -27,7 +27,9 @@ type relay struct {
 	// closeCode is why closeFirst drops it: 4001 when another connection
 	// took the client's place, 4003 kicked, 4004 ended.
 	closeCode websocket.StatusCode
-	served    int
+	// streams ride the welcome, as the room's held links do.
+	streams []Stream
+	served  int
 }
 
 func newRelay(t *testing.T) (*relay, *httptest.Server) {
@@ -73,6 +75,7 @@ func (r *relay) serveConn(conn *websocket.Conn) {
 		Code:       "TESTROOM",
 		You:        &You{Client: "me", Host: true},
 		Members:    []Member{{Client: "me", Name: "我", Host: true}},
+		Streams:    r.streams,
 	}))
 	if r.closeFirst && first {
 		time.Sleep(100 * time.Millisecond)
@@ -101,6 +104,17 @@ func (r *relay) serveConn(conn *websocket.Conn) {
 			pb := *msg.Playback
 			pb.UpdatedAt = time.Now().UnixMilli()
 			_ = conn.Write(ctx, websocket.MessageText, mustJSON(wire{T: "playback", Playback: &pb}))
+		case "stream":
+			shared := *msg.Stream
+			shared.At = time.Now().UnixMilli()
+			_ = conn.Write(ctx, websocket.MessageText, mustJSON(wire{T: "stream", Stream: &shared}))
+		case "queue":
+			q := *msg.Queue
+			q.Rev = 1
+			_ = conn.Write(ctx, websocket.MessageText, mustJSON(wire{T: "queue", Queue: &q}))
+		case "transfer":
+			// The room hands itself over: the sender is a guest from now on.
+			_ = conn.Write(ctx, websocket.MessageText, mustJSON(wire{T: "you", You: &You{Client: "me", Host: false}}))
 		}
 	}
 }
@@ -270,4 +284,89 @@ func awaitKind(t *testing.T, ch <-chan Event, kind string) Event {
 
 func errorsIs(err, target error) bool {
 	return err != nil && target != nil && (err == target || strings.Contains(err.Error(), target.Error()))
+}
+
+// The room carries a resolved link, the host's queue and a hand-over as
+// messages of their own: a guest needs no chat to hear a member's song.
+func TestClientSharesStreamQueueAndTransfersRoom(t *testing.T) {
+	_, srv := newRelay(t)
+	events := make(chan Event, 32)
+	c := New(Options{
+		Relay:    srv.URL,
+		Code:     "TESTROOM",
+		ClientID: "me",
+		Name:     "我",
+		HTTP:     srv.Client(),
+		OnEvent:  func(ev Event) { events <- ev },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	awaitKind(t, events, EventWelcome)
+
+	if err := c.ShareStream(Stream{TrackID: 9, URL: "https://ws.stream.qqmusic.qq.com/M5009.mp3?vkey=k", Type: "mp3", Size: 2048, Level: "standard"}); err != nil {
+		t.Fatal(err)
+	}
+	ev := awaitKind(t, events, EventStream)
+	if ev.Stream == nil || ev.Stream.TrackID != 9 || ev.Stream.URL == "" {
+		t.Fatalf("unexpected stream: %+v", ev.Stream)
+	}
+
+	queue := Queue{Tracks: []Track{{ID: 9, Name: "九"}, {ID: 10, Name: "十"}}, Index: 1}
+	if err := c.PublishQueue(queue); err != nil {
+		t.Fatal(err)
+	}
+	ev = awaitKind(t, events, EventQueue)
+	if ev.Queue == nil || len(ev.Queue.Tracks) != 2 || ev.Queue.Index != 1 {
+		t.Fatalf("unexpected queue: %+v", ev.Queue)
+	}
+
+	if err := c.Transfer("friend"); err != nil {
+		t.Fatal(err)
+	}
+	ev = awaitKind(t, events, EventYou)
+	if ev.You == nil || ev.You.Host {
+		t.Fatalf("the room should no longer be this member's: %+v", ev.You)
+	}
+}
+
+// The welcome carries the links the room already holds, so a member who
+// joins late plays the same file without anyone signing again.
+func TestWelcomeCarriesRoomStreams(t *testing.T) {
+	r, srv := newRelay(t)
+	r.streams = []Stream{{TrackID: 7, URL: "https://ws.stream.qqmusic.qq.com/M5007.mp3?vkey=k", Type: "mp3", Size: 900, Level: "standard", By: "old", ByName: "会员朋友"}}
+	events := make(chan Event, 8)
+	c := New(Options{Relay: srv.URL, Code: "TESTROOM", ClientID: "me", Name: "我", HTTP: srv.Client(), OnEvent: func(ev Event) { events <- ev }})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	ev := awaitKind(t, events, EventWelcome)
+	if ev.Welcome == nil || len(ev.Welcome.Streams) != 1 {
+		t.Fatalf("the welcome did not carry the room's links: %+v", ev.Welcome)
+	}
+	if got := ev.Welcome.Streams[0]; got.TrackID != 7 || got.ByName != "会员朋友" {
+		t.Fatalf("unexpected stream: %+v", got)
+	}
+}
+
+// The room sets the beat, as QQ 音乐 carries heartBeatInterval in its room,
+// but a room cannot make a member chat every millisecond or go quiet for an
+// hour: the beat stays inside what the server sweeps on.
+func TestHeartbeatFollowsTheRoomWithinBounds(t *testing.T) {
+	c := New(Options{Relay: "http://127.0.0.1:1"})
+	if c.heartbeat != 0 {
+		t.Fatalf("no beat until the room asks for one: %v", c.heartbeat)
+	}
+	c.SetHeartbeat(12 * time.Second)
+	if c.heartbeat != 12*time.Second {
+		t.Fatalf("beat = %v, want the room's 12s", c.heartbeat)
+	}
+	c.SetHeartbeat(time.Millisecond)
+	if c.heartbeat != MinHeartbeat {
+		t.Fatalf("beat = %v, want it held at %v", c.heartbeat, MinHeartbeat)
+	}
+	c.SetHeartbeat(time.Hour)
+	if c.heartbeat != MaxHeartbeat {
+		t.Fatalf("beat = %v, want it held at %v", c.heartbeat, MaxHeartbeat)
+	}
 }

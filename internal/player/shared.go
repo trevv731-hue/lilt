@@ -21,6 +21,10 @@ type sharedStream struct {
 var (
 	sharedMu sync.Mutex
 	shared   = map[int64]sharedStream{}
+	// sharedWake closes as a link arrives, waking whoever is waiting for
+	// one: a guest starts loading the room's track the moment the anchor
+	// lands, usually before the member who can sign it has shared.
+	sharedWake = make(chan struct{})
 )
 
 // ShareStream records the stream a member of the room resolved for a
@@ -28,7 +32,9 @@ var (
 // One membership in the room is enough, because the signed URL plays for
 // anyone holding it.
 func ShareStream(id int64, s qqmusic.Stream) {
-	if id == 0 || s.URL == "" {
+	// A trial is not the song: sharing it would have the whole room listen
+	// to thirty seconds and stay out of step.
+	if id == 0 || s.URL == "" || s.Trial {
 		return
 	}
 	sharedMu.Lock()
@@ -42,9 +48,12 @@ func ShareStream(id int64, s qqmusic.Stream) {
 		}
 	}
 	shared[id] = sharedStream{stream: s, at: time.Now()}
+	close(sharedWake)
+	sharedWake = make(chan struct{})
 }
 
-// SharedStream looks up what the room resolved for id.
+// SharedStream looks up what the room resolved for id: the link a member
+// whose account holds the rights signed, which plays for anyone holding it.
 func SharedStream(id int64) (qqmusic.Stream, bool) {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
@@ -68,26 +77,41 @@ var expectShared atomic.Bool
 
 // ExpectSharedStreams tells the player a room is open: outside one, a link the
 // account cannot resolve is a failure at once.
-func ExpectSharedStreams(on bool) { expectShared.Store(on) }
+func ExpectSharedStreams(on bool) {
+	expectShared.Store(on)
+	// Only a room needs to tell a trial from a song, and only there is the
+	// extra look at the CDN worth making: ordinary playback stays exactly
+	// the requests QQ Music's own client makes.
+	qqmusic.DetectTrial(on)
+}
 
-// waitSharedStream waits for the room's link: a listener starts loading the
-// room's new track as soon as the anchor arrives, which is usually before
-// whoever can resolve it has shared it.
+// waitSharedStream waits for the room's link. It wakes as soon as one
+// arrives, and gives up at limit: a room whose members can none of them
+// sign the track stays silent rather than loading forever.
 func waitSharedStream(id int64, limit time.Duration) (qqmusic.Stream, bool) {
-	if !expectShared.Load() {
-		if s, ok := SharedStream(id); ok {
-			return s, true
-		}
-		return qqmusic.Stream{}, false
-	}
+	expecting := expectShared.Load()
 	deadline := time.Now().Add(limit)
 	for {
-		if s, ok := SharedStream(id); ok {
-			return s, true
+		sharedMu.Lock()
+		if v, ok := shared[id]; ok && time.Since(v.at) <= sharedLife {
+			sharedMu.Unlock()
+			return v.stream, true
 		}
-		if time.Now().After(deadline) {
+		if !expecting {
+			sharedMu.Unlock()
 			return qqmusic.Stream{}, false
 		}
-		time.Sleep(150 * time.Millisecond)
+		wake := sharedWake
+		sharedMu.Unlock()
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return qqmusic.Stream{}, false
+		}
+		timer := time.NewTimer(min(remain, 250*time.Millisecond))
+		select {
+		case <-wake:
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
 }

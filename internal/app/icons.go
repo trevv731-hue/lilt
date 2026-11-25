@@ -70,4 +70,8 @@ var (
 	iconTogether = strokeIcon(`<circle cx="9" cy="8" r="3.5"/><path d="M2.5 21a6.5 6.5 0 0 1 13 0"/><circle cx="17.5" cy="10" r="2.8"/><path d="M15.7 15.5a5.6 5.6 0 0 1 5.8 5.5"/>`)
 	iconCopy     = strokeIcon(`<rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>`)
 	iconSend     = fillIcon(`<path d="M3.4 20.6 21 12 3.4 3.4l.1 6.9L15 12 3.5 13.7z"/>`)
+	// iconCrown marks the member who holds the room, as QQ 音乐 marks a host.
+	iconCrown = fillIcon(`<path d="M3 8.6 6.7 12 12 4.6 17.3 12 21 8.6 19.4 19H4.6z"/>`)
+	// iconHistory opens a room's end card: what it heard, and when.
+	iconHistory = strokeIcon(`<path d="M3.2 12a8.8 8.8 0 1 0 2.6-6.2"/><path d="M3 4.4v4.6h4.6"/><path d="M12 7.8V12l3.2 2"/>`)
 )

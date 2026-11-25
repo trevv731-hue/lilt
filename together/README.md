@@ -18,21 +18,40 @@ Cloudflare Worker + Durable Object，一台 Durable Object 是一间房：成员
 
 ## 消息
 
-客户端 → 服务端：`ping`、`playback`（任何成员）、`request`（next/prev）、`chat`、`profile`（改名/换头像）、`stream.request`（求一条播放直链）、`pending.add`、`pending.remove`、`pending.play`（任何成员）、`kick`（仅房主）、`end`（仅房主）。
+客户端 → 服务端：`ping`、`playback`（任何成员）、`request`（next/prev）、`chat`、`profile`（改名/换头像）、`stream.request`（求一条播放直链）、`stream`（把签好的直链交给房间）、`queue`（房主镜像队列）、`transfer`（房主转让，仅房主）、`pending.add`、`pending.remove`、`pending.play`（任何成员）、`kick`（仅房主）、`end`（仅房主）。
 
-服务端 → 客户端：`welcome`（带 `features`）、`members`、`playback`（带服务器时间戳）、`request`、`stream.request`、`play`（点歌台开始播放）、`pending`、`chat`、`pong`、`end`、`error`。
+服务端 → 客户端：`welcome`（带 `features`、当前 `stream` 与 `queue`）、`members`、`playback`（带服务器时间戳）、`request`、`stream.request`、`stream`、`queue`、`you`（你是否持有房间）、`play`（点歌台开始播放）、`pending`、`chat`（含 `sys` 系统行）、`pong`、`end`、`error`。
+
+`features` 现在是 `profile, stream, desk, transfer, stream2, queue`；旧服务端缺哪项，客户端就退回旧行为（例如 `stream2` 缺失时仍用聊天隐藏分片传链接）。
+
+`stream` 额外带 `by` / `byName`（服务端写入），`welcome` 额外带 `streams`（该房间最近仍有效的全部链接）。
 
 ## 同步与控制
 
-- 房主每 4 秒发一次播放锚点 `{track, playing, positionMs}`；服务器收到时写入自己的 `updatedAt`，客户端不依赖房主时钟。
-- 房间里任何一个成员解析出当前歌曲的播放直链，都会通过聊天里的隐藏信令分享；没有会员的一方直接复用这条直链，所以“谁有会员谁分享”，不要求房主是会员。
-- 谁的账号都解析不出来时，客户端发 `stream.request`，其他成员收到后重新分享一次。
+- 房主在播放器每次变化后 60–120ms 内发一次锚点 `{track, playing, positionMs}`（合并同一动作的连续变化），并每 4 秒补一次心跳锚点；服务器收到时写入自己的 `updatedAt`，客户端不依赖房主时钟。
+- 房主同时镜像自己的队列 `{tracks, index}`，访客据此建立同一份队列并在正确索引落点，所以“下一首”不用重新加载单曲。
+- 房间里任何一个成员解析出当前歌曲的播放直链，都会把 `{trackId, url, type, size, level}` 交给房间；服务端按曲目保存（最近 40 首、40 分钟）并在 `welcome` 的 `stream`/`streams` 里发给后来的人，没有会员的一方直接复用，所以“谁有会员谁分享”，不要求房主是会员。
+- 服务端给链接署名（`by`/`byName`，由服务端从连接信息写入，成员不能冒充），客户端据此显示“音源来自「某某」的会员”。
+- 谁的账号都解析不出来时，客户端发 `stream.request`，服务端先把手上那条直接回给它；其他成员收到后会用**自己的账号当场调 QQ 的签链接接口**（每曲 15 秒一次），所以没有会员的人点一首 VIP 歌，有会员的那台客户端即使没在播这首也能供源。
+- 只接受 QQ 音乐自己的 CDN (`*.qq.com` / `*.qqmusic.qq.com`) 的链接，房间成员不能借别人的客户端请求任意地址。
+- 同一首歌两个会员各有一条链接时，以房间已经持有的那条为准，不会每秒互相覆盖；只有收到 `stream.request` 时才重新出价。
+- 播放时每个账号优先用**自己签的**链接（QQ 侧就是一次正常播放），只有签不出来的那一端才用房间里的链接；代签只在收到 `stream.request` 时发生，同一首歌被拒绝后 10 分钟内不再请求，避免在 QQ 侧留下可辨认的重复模式。
 - 客户端每 15 秒 `ping/pong` 估算服务器时钟偏移，取最小 RTT 样本；欢迎消息的 `serverTime` 用于第一时间播种时钟。
 - 访客的目标位置 = `positionMs + (serverNow - updatedAt)`（播放中）；偏差超过 400ms 才 seek，且 5 秒冷却；加载中的 seek 只更新落点，不计入冷却，加载完成后立即校正。
 - 播放/暂停/拖动进度由任何成员发起，服务器按到达顺序后写覆盖；客户端应用远端状态时置 `applying`，不回声发布。
 - 下一首/上一首由访客发 `request`，房主队列执行后再发布新锚点；选歌仍由房主队列与点歌台决定。
 - 点歌台的「播放」任何成员都能点：服务器广播 `play`，房主把它插进自己的队列并立即播放，再发布锚点。旧版服务端没有 `play` 时，客户端退回“本机播放并发布锚点”。
-- 房主每 4 秒重发锚点；访客不发表周期锚点，只在本地用户操作后发布。
+- 房主每 4 秒重发锚点；访客不发表周期锚点，只在本地用户操作后 120ms 内发布（合并拖动进度的连续 seek）。
+- 房主可以 `transfer` 把房间交给任意成员：服务端改写房间的 `hostClient` 并给每个人发 `you`，新房主立刻发布锚点，播放不中断；旧房主的 `hostKey` 在转让后失效。
+- 进房/退房/转让会在聊天里留一条 `sys` 系统行，像 QQ 音乐在房间里播报“谁来了/谁走了”。
+
+## 安全
+
+- 房间列表只显示成员句柄（房间密钥的哈希），不是客户端重连用的私有 ID；房主的 `hostKey` 走 `X-Lilt-Host-Key` header，不放进 URL。
+- 带 `Origin` 的请求（浏览器）在 `/room` 与 `/ws` 上直接 403；CORS 不放开，页面无法顺带创建房间或连房间。
+- 按 IP 限速：建房 10 次/分钟、查房 60 次/分钟、连接 30 次/分钟（每个 isolate），另有建房 60 次/分钟的总闸；URL 超过 2048 字节返回 414。
+- 直链只收 `*.qq.com` / `*.qqmusic.qq.com`；封面与头像只收 QQ 的域名。消息各有上限与速率（连接 20 条/秒、播放 10 条/秒、分享/求链接各 2 秒一次）。
+- Cloudflare 控制台建议再加一条按 IP 的 WAF 限速规则（`POST /room` 10/min、`/ws` 30/min），这是跨 PoP 的、比 Worker 内单 isolate 更硬的保护。
 
 ## 部署
 
@@ -44,6 +63,8 @@ npx wrangler deploy
 `wrangler.jsonc` 默认部署到 `together.bdprk.com`（自定义域名）。如果域名不在当前 Cloudflare 账号，删掉 `routes` 一行，使用 `lilt-together.<account>.workers.dev`。
 
 客户端默认连接 `wss://together.bdprk.com`；可在 `settings.json` 里用 `togetherRelay` 改成别的地址，本地调试用 `http://127.0.0.1:8787`。
+
+会员音源的完整流程、验证清单和排错表见 `docs/together-vip.md`。
 
 ## 本地联调
 
@@ -72,7 +93,9 @@ go run ./cmd/together-probe -relay https://together.bdprk.com
 
 ## 常见问题
 
-- **访客没有声音**：先看访客端是否提示“可能需要 VIP”。房间里只要有一个人的账号能签出这首歌的直链，链接就会分享给所有人；两个人都不是会员时，会员曲目仍然放不了。
+- **访客没有声音**：先看访客端是否提示“可能需要 VIP”。房间里只要有一个人的账号能签出这首歌的直链，链接就会分享给所有人（`stream` 消息，新进房的人在 `welcome` 里就能拿到）；两个人都不是会员时，会员曲目仍然放不了。
+- **只听到 30 秒**：说明两边都没有能签这首曲子的账号，客户端退回 QQ 给的试听片段，界面会写“只拿到试听片段”。试听永远不会被当成整首分享或缓存。
+- **点了歌但会员那台没反应**：确认它仍在线且房间未断；代签需要它的 QQ 登录态有效。
 - **点了下一首没反应**：下一首由房主队列执行；确认房主客户端仍在线。房主断线 2 分钟房间会结束。
 - **点歌台点了播放没反应**：旧版服务端只允许房主播放，且只把歌排到下一首；升级服务端后任何成员点播放都会立刻切歌。
 - **进度短暂有偏差**：客户端每秒校正一次，超过 400ms 才 seek，且有 5 秒冷却；切歌加载完成后会立即再校准一次。

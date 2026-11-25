@@ -103,6 +103,7 @@ func main() {
 	if welcome.Welcome == nil || !welcome.Welcome.You.Host {
 		fail("host welcome", fmt.Errorf("not host: %+v", welcome))
 	}
+	hostID := welcome.Welcome.You.Client
 
 	guestAvatar := "https://thirdqq.qlogo.cn/g?b=qq&nk=10002&s=160"
 	guestEvents := make(chan together.Event, 64)
@@ -112,7 +113,13 @@ func main() {
 	})
 	go guest.Run(ctx)
 	guestWelcome := waitKind(ctx, guestEvents, together.EventWelcome)
-	if got := memberAvatar(guestWelcome.Welcome.Members, "probe-host"); got != hostAvatar {
+	guestID := guestWelcome.Welcome.You.Client
+	// The room shows a handle, not the client id a connection reconnects
+	// with: a member who read it could otherwise join as somebody else.
+	if hostID == "probe-host" || guestID == "probe-guest" {
+		fail("member handles", fmt.Errorf("the room exposed a private client id: %q %q", hostID, guestID))
+	}
+	if got := memberAvatar(guestWelcome.Welcome.Members, "房主"); got != hostAvatar {
 		fail("host avatar", fmt.Errorf("got %q", got))
 	}
 	if !slices.Contains(guestWelcome.Welcome.Features, "desk") {
@@ -165,7 +172,7 @@ func main() {
 	if err := guest.SetProfile("访客改名", renamedAvatar); err != nil {
 		fail("guest profile", err)
 	}
-	renamed := waitMemberName(ctx, hostEvents, "probe-guest", "访客改名")
+	renamed := waitMember(ctx, hostEvents, "访客改名")
 	if renamed.Name != "访客改名" || renamed.Avatar != renamedAvatar {
 		fail("profile", fmt.Errorf("got %+v", renamed))
 	}
@@ -181,6 +188,80 @@ func main() {
 		fail("stream request", fmt.Errorf("asked for %d, want %d", asked.TrackID, track.ID))
 	}
 	fmt.Println("stream request ok")
+
+	// Whoever can sign the room's track shares the link as a message of its
+	// own: one membership covers everyone.
+	const sharedURL = "https://ws.stream.qqmusic.qq.com/M500123456.mp3?vkey=probe"
+	if err := host.ShareStream(together.Stream{TrackID: track.ID, URL: sharedURL, Type: "mp3", Size: 2048, Level: "standard"}); err != nil {
+		fail("host share stream", err)
+	}
+	shared := waitKind(ctx, guestEvents, together.EventStream)
+	if shared.Stream == nil || shared.Stream.TrackID != track.ID || shared.Stream.URL != sharedURL {
+		fail("guest stream", fmt.Errorf("%+v", shared.Stream))
+	}
+	if shared.Stream.ByName == "" {
+		fail("stream source", fmt.Errorf("the room did not name who signed it: %+v", shared.Stream))
+	}
+	fmt.Println("stream share ok")
+
+	// The room keeps the link: a later request is answered by the server
+	// itself, with no member asked to sign it again.
+	if err := guest.RequestStream(track.ID); err != nil {
+		fail("second stream request", err)
+	}
+	cached := waitKind(ctx, guestEvents, together.EventStream)
+	if cached.Stream == nil || cached.Stream.URL != sharedURL {
+		fail("cached stream", fmt.Errorf("%+v", cached.Stream))
+	}
+	fmt.Println("stream cache ok")
+
+	// A link outside QQ Music's own CDNs is refused, so a room member
+	// cannot send the others' clients to fetch an arbitrary address.
+	if err := guest.ShareStream(together.Stream{TrackID: track.ID, URL: "https://example.invalid/x.mp3", Type: "mp3"}); err != nil {
+		fail("foreign stream", err)
+	}
+	if ev := waitKind(ctx, guestEvents, together.EventServerError); ev.Code != "bad_stream" {
+		fail("foreign stream refused", fmt.Errorf("code %q", ev.Code))
+	}
+	fmt.Println("stream origin ok")
+
+	// The host mirrors its queue, so a guest holds the same list.
+	next := together.Track{ID: 654321, MID: "probe2", Name: "下一首", Duration: 180_000}
+	if err := host.PublishQueue(together.Queue{Tracks: []together.Track{track, next}, Index: 0}); err != nil {
+		fail("host queue", err)
+	}
+	queue := waitKind(ctx, guestEvents, together.EventQueue)
+	if queue.Queue == nil || len(queue.Queue.Tracks) != 2 || queue.Queue.Tracks[1].ID != next.ID {
+		fail("guest queue", fmt.Errorf("%+v", queue.Queue))
+	}
+	fmt.Println("queue ok")
+
+	// A guest cannot hand the room over; the host can, and the room says so
+	// to both sides.
+	if err := guest.Transfer(hostID); err != nil {
+		fail("guest transfer", err)
+	}
+	if ev := waitKind(ctx, guestEvents, together.EventServerError); ev.Code != "not_host" {
+		fail("guest transfer refused", fmt.Errorf("code %q", ev.Code))
+	}
+	if err := host.Transfer(guestID); err != nil {
+		fail("host transfer", err)
+	}
+	waitYou(ctx, guestEvents, true)
+	waitYou(ctx, hostEvents, false)
+	// The old host keeps no hold on the room, key or not.
+	if err := host.End(); err != nil {
+		fail("old host end", err)
+	}
+	if ev := waitKind(ctx, hostEvents, together.EventServerError); ev.Code != "not_host" {
+		fail("old host refused", fmt.Errorf("code %q", ev.Code))
+	}
+	fmt.Println("transfer ok")
+	if err := guest.Transfer(hostID); err != nil {
+		fail("new host transfer back", err)
+	}
+	waitYou(ctx, hostEvents, true)
+	waitYou(ctx, guestEvents, false)
 
 	if err := guest.AddPending(track); err != nil {
 		fail("guest pending", err)
@@ -209,16 +290,35 @@ func main() {
 		OnEvent: func(ev together.Event) { extraEvents <- ev },
 	})
 	go extra.Run(ctx)
-	waitKind(ctx, extraEvents, together.EventWelcome)
+	extraWelcome := waitKind(ctx, extraEvents, together.EventWelcome)
+	extraID := extraWelcome.Welcome.You.Client
+	// A member who joins late gets the room's link and queue with the
+	// welcome, so the music needs no one to answer.
+	if extraWelcome.Welcome.Stream == nil || extraWelcome.Welcome.Stream.URL != sharedURL {
+		fail("late joiner stream", fmt.Errorf("%+v", extraWelcome.Welcome.Stream))
+	}
+	held := false
+	for _, s := range extraWelcome.Welcome.Streams {
+		if s.TrackID == track.ID && s.URL == sharedURL {
+			held = true
+		}
+	}
+	if !held {
+		fail("late joiner streams", fmt.Errorf("%+v", extraWelcome.Welcome.Streams))
+	}
+	if extraWelcome.Welcome.Queue == nil || len(extraWelcome.Welcome.Queue.Tracks) != 2 {
+		fail("late joiner queue", fmt.Errorf("%+v", extraWelcome.Welcome.Queue))
+	}
+	fmt.Println("late join ok")
 	time.Sleep(200 * time.Millisecond)
-	if err := host.Kick("probe-extra"); err != nil {
+	if err := host.Kick(extraID); err != nil {
 		fail("host kick", err)
 	}
 	kicked := waitKind(ctx, extraEvents, together.EventStatus)
 	if !errors.Is(kicked.Err, together.ErrKicked) {
 		fail("kicked member", fmt.Errorf("unexpected event: %+v", kicked))
 	}
-	waitMemberGone(ctx, hostEvents, "probe-extra")
+	waitMemberGone(ctx, hostEvents, "第三人")
 	fmt.Println("kick ok")
 
 	badCtx, badCancel := context.WithCancel(ctx)
@@ -230,13 +330,32 @@ func main() {
 	})
 	go bad.Run(badCtx)
 	waitKind(ctx, badEvents, together.EventWelcome)
-	if got := waitMember(ctx, hostEvents, "probe-bad").Avatar; got != "" {
+	if got := waitMember(ctx, hostEvents, "坏头像").Avatar; got != "" {
 		fail("avatar sanitize", fmt.Errorf("a third-party avatar URL survived: %q", got))
 	}
 	_ = bad.Leave()
 	badCancel()
-	waitMemberGone(ctx, hostEvents, "probe-bad")
+	waitMemberGone(ctx, hostEvents, "坏头像")
 	fmt.Println("avatar ok")
+
+	// A public handle is not a credential: joining with the host's handle
+	// as a client id must not take the room or displace the host.
+	impEvents := make(chan together.Event, 8)
+	imp := together.New(together.Options{
+		Relay: *relay, Code: room.Code, ClientID: hostID, Name: "冒名",
+		OnEvent: func(ev together.Event) { impEvents <- ev },
+	})
+	go imp.Run(ctx)
+	impWelcome := waitKind(ctx, impEvents, together.EventWelcome)
+	if impWelcome.Welcome == nil || impWelcome.Welcome.You.Host {
+		fail("handle impersonation", fmt.Errorf("a public handle took the room: %+v", impWelcome.Welcome))
+	}
+	_ = imp.End()
+	if ev := waitKind(ctx, impEvents, together.EventServerError); ev.Code != "not_host" {
+		fail("handle impersonation end", fmt.Errorf("code %q", ev.Code))
+	}
+	_ = imp.Leave()
+	fmt.Println("handle ok")
 
 	if err := host.End(); err != nil {
 		fail("host end", err)
@@ -249,6 +368,20 @@ func main() {
 
 	cancel()
 	fmt.Println("PASS")
+}
+
+// waitYou waits for the room to say whether it is this member's now.
+func waitYou(ctx context.Context, events <-chan together.Event, host bool) {
+	for {
+		select {
+		case ev := <-events:
+			if ev.Kind == together.EventYou && ev.You != nil && ev.You.Host == host {
+				return
+			}
+		case <-ctx.Done():
+			fail("you", ctx.Err())
+		}
+	}
 }
 
 func waitStatus(ctx context.Context, events <-chan together.Event, target error) together.Event {
@@ -293,9 +426,9 @@ func staleCheck(relay string) {
 	}
 	defer conn.CloseNow()
 
-	waitMember(ctx, hostEvents, "probe-stale")
+	waitMember(ctx, hostEvents, "幽灵")
 	fmt.Println("stale member listed; waiting for the sweep")
-	waitMemberGone(ctx, hostEvents, "probe-stale")
+	waitMemberGone(ctx, hostEvents, "幽灵")
 	fmt.Println("STALE PASS")
 	_ = host.End()
 }
@@ -493,7 +626,9 @@ func soakCheck(relay string, minutes int) {
 	_ = host.End()
 }
 
-func waitMember(ctx context.Context, events <-chan together.Event, client string) together.Member {
+// The probe finds members by name: the room shows public handles now, not
+// the client ids a connection keeps to itself.
+func waitMember(ctx context.Context, events <-chan together.Event, name string) together.Member {
 	for {
 		select {
 		case ev := <-events:
@@ -501,18 +636,18 @@ func waitMember(ctx context.Context, events <-chan together.Event, client string
 				continue
 			}
 			for _, m := range ev.Members {
-				if m.Client == client {
+				if m.Name == name {
 					return m
 				}
 			}
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "timed out waiting for %s in the member list\n", client)
+			fmt.Fprintln(os.Stderr, "timed out waiting for", name, "in the member list")
 			os.Exit(1)
 		}
 	}
 }
 
-func waitMemberGone(ctx context.Context, events <-chan together.Event, client string) {
+func waitMemberGone(ctx context.Context, events <-chan together.Event, name string) {
 	for {
 		select {
 		case ev := <-events:
@@ -521,7 +656,7 @@ func waitMemberGone(ctx context.Context, events <-chan together.Event, client st
 			}
 			gone := true
 			for _, m := range ev.Members {
-				if m.Client == client {
+				if m.Name == name {
 					gone = false
 				}
 			}
@@ -529,36 +664,15 @@ func waitMemberGone(ctx context.Context, events <-chan together.Event, client st
 				return
 			}
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "timed out waiting for %s to leave the member list\n", client)
+			fmt.Fprintln(os.Stderr, "timed out waiting for", name, "to leave the member list")
 			os.Exit(1)
 		}
 	}
 }
 
-// waitMemberName waits for the member list to show client under name, as
-// after a profile update.
-func waitMemberName(ctx context.Context, events <-chan together.Event, client, name string) together.Member {
-	for {
-		select {
-		case ev := <-events:
-			if ev.Kind != together.EventMembers {
-				continue
-			}
-			for _, m := range ev.Members {
-				if m.Client == client && m.Name == name {
-					return m
-				}
-			}
-		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "timed out waiting for %s to be named %s\n", client, name)
-			os.Exit(1)
-		}
-	}
-}
-
-func memberAvatar(members []together.Member, client string) string {
+func memberAvatar(members []together.Member, name string) string {
 	for _, m := range members {
-		if m.Client == client {
+		if m.Name == name {
 			return m.Avatar
 		}
 	}

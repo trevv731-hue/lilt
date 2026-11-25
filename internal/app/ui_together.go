@@ -2,12 +2,14 @@ package app
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/egoist/mygo/ui"
 
 	"lilt/internal/lyrics"
+	"lilt/internal/player"
 	"lilt/internal/qqmusic"
 	"lilt/internal/together"
 )
@@ -31,6 +33,7 @@ func (a *app) togetherPage(c *ui.Context) {
 		a.startMark(c)
 		defer a.endMark(c)
 		a.heading(c, "一起听", "两个人，同一首歌")
+		a.togetherEndCard(c)
 		a.togetherEntry(c)
 	})
 }
@@ -84,19 +87,100 @@ func (a *app) togetherEntry(c *ui.Context) {
 		in := ui.TextInput(c.Key("together-relay"), &a.settings.TogetherRelay).Placeholder(together.DefaultRelay).FontSize(11.5).Height(28).Width(320)
 		if in.Submitted() {
 			a.settings.save()
-			a.toast = "房间服务器已保存"
+			st.entryNote = "房间服务器已保存"
+			// The relay was set by hand: check it now rather than on the
+			// first room, which is when a wrong address costs a song.
+			if err := together.ValidateRelay(a.togetherRelay()); err != nil {
+				st.entryNote = ""
+				st.err = err.Error()
+			}
+			a.redraw()
 		}
 		ui.Text(c, "留空使用默认").FontSize(11).TextColor(p.faint)
 	})
 
+	if st.noteLive(time.Now()) && st.note != "" {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Margin(10, 0, 0, 0).Children(func() {
+			ui.Box(c).Size(5, 5).Radius(3).Background(p.muted)
+			ui.Text(c, st.note).FontSize(12).TextColor(p.muted).MaxLines(1)
+		})
+	}
+
+	if st.entryNote != "" {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Margin(10, 0, 0, 0).Children(func() {
+			ui.Icon(c, iconCheck).Size(13, 13).TextColor(p.accent)
+			ui.Text(c, st.entryNote).FontSize(12).TextColor(p.muted).Grow(1)
+		})
+	}
+
 	if st.err != "" {
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Margin(10, 0, 0, 0).Children(func() {
-			ui.Text(c, st.err).FontSize(12.5).TextColor(p.muted).MaxLines(2).Grow(1)
+			ui.Text(c, st.err).FontSize(12.5).TextColor(p.warn).MaxLines(2).Grow(1)
 			if pillButton(c.Key("together-retry"), iconTogether, "重试", p.hover, p.text).Clicked() {
-				a.togetherCreate()
+				if st.entryRetry == "join" {
+					a.togetherJoin()
+				} else {
+					a.togetherCreate()
+				}
 			}
 		})
 	}
+}
+
+// togetherEndCard is the room that just ended, drawn the way QQ 音乐 draws
+// its end card: the songs that were heard, how long it lasted, and who was
+// there, with a way back in. The card stays until it is dismissed, so a
+// dropped connection never looks like the evening vanished.
+func (a *app) togetherEndCard(c *ui.Context) {
+	p := a.pal
+	st := &a.together
+	sum := st.summary
+	if sum == nil {
+		return
+	}
+	ui.Column(c).Padding(20).Gap(10).Radius(22).Margin(0, 0, 0, 0).
+		Background(p.sidebar).Border(1, p.hairline).Children(func() {
+		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Box(c).Size(36, 36).Radius(12).Center().Background(p.accent.Alpha(0.14)).Children(func() {
+				ui.Icon(c, iconHistory).Size(17, 17).TextColor(p.accent)
+			})
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, "一起听到这里").FontSize(18).FontWeight(700)
+				ui.Text(c, sum.ended).FontSize(11.5).TextColor(p.muted).SingleLine()
+			})
+			if pillButton(c.Key("together-again"), iconTogether, "再来一间", p.accent, p.onAccent).Clicked() {
+				st.summary = nil
+				a.togetherCreate()
+			}
+			if ui.Button(c.Key("together-card-close"), "知道了").Clicked() {
+				st.summary = nil
+				a.redraw()
+			}
+		})
+		var facts []string
+		if sum.dur > 0 {
+			facts = append(facts, clock(sum.dur)+" 一起听")
+		}
+		if n := len(sum.songs); n > 0 {
+			facts = append(facts, fmt.Sprintf("%d 首歌", n))
+		}
+		if name := sum.name; name != "" {
+			facts = append(facts, name+" 的房间")
+		}
+		if len(facts) > 0 {
+			ui.Text(c, strings.Join(facts, " · ")).FontSize(12).TextColor(p.muted).MaxLines(1)
+		}
+		if len(sum.people) > 0 {
+			ui.Text(c, "和 "+strings.Join(sum.people, "、")).FontSize(11.5).TextColor(p.faint).MaxLines(1)
+		}
+		if len(sum.songs) > 0 {
+			shown := sum.songs
+			if len(shown) > 6 {
+				shown = shown[:6]
+			}
+			ui.Text(c, strings.Join(shown, " / ")).FontSize(11.5).TextColor(p.faint).MaxLines(2)
+		}
+	})
 }
 
 // togetherEntryCard is one of the two cards before joining: an icon, a
@@ -135,32 +219,59 @@ func (a *app) togetherRoom(c *ui.Context, top, bottom float32) {
 	w, _ := c.Size()
 	wide := w >= 1400
 	ui.Column(c).Fill().Background(togetherCanvas(a.pal.dark)).
-		Padding(top+12, 28, bottom+14, 28).Gap(14).Children(func() {
+		Padding(top+14, 28, bottom+16, 28).Gap(12).Children(func() {
 		a.togetherTopBar(c)
 		if wide {
-			ui.Row(c).Grow(1).Gap(18).AlignItems(ui.Stretch).Children(func() {
+			ui.Row(c).Grow(1).Gap(12).AlignItems(ui.Stretch).Children(func() {
 				a.togetherStage(c)
-				ui.Column(c).Width(356).Shrink(0).Gap(14).Children(func() {
-					a.togetherRequests(c)
+				ui.Column(c).Width(352).Shrink(0).Gap(12).Children(func() {
+					a.togetherDesk(c)
 					a.togetherChatCard(c)
 				})
 			})
 			return
 		}
 		a.togetherStage(c)
-		ui.Row(c).Grow(1).Gap(18).AlignItems(ui.Stretch).Children(func() {
-			a.togetherRequests(c)
+		ui.Row(c).Grow(1).Gap(12).AlignItems(ui.Stretch).Children(func() {
+			a.togetherDesk(c)
 			a.togetherChatCard(c)
 		})
 	})
 }
 
 // togetherTopBar says whose room this is and who is in it, as QQ 音乐 puts
-// its listeners along the top of the page.
+// its listeners along the top of the page: the name and code at the left,
+// the people and the invitation at the right, and nothing else.
 func (a *app) togetherTopBar(c *ui.Context) {
 	p := a.pal
 	st := &a.together
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Column(c).Gap(5).Children(func() {
+			name := st.hostName()
+			if name == "" {
+				name = "一起听"
+			} else {
+				name += " 的一起听"
+			}
+			ui.Text(c, name).FontSize(17).FontWeight(700).LetterSpacing(-0.2).SingleLine().MaxWidth(320)
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Height(22).PaddingX(8).Radius(7).Gap(5).AlignItems(ui.Center).
+					Background(p.sidebar).Border(1, p.hairline).Children(func() {
+					ui.Text(c, "房间号").FontSize(10).TextColor(p.faint)
+					ui.Text(c, st.code).FontSize(11.5).FontWeight(700).LetterSpacing(1.2).TextColor(p.text)
+				})
+				a.togetherSyncPill(c)
+			})
+		})
+		ui.Box(c).Grow(1)
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			for _, m := range st.members {
+				a.togetherMember(c, m)
+			}
+		})
+		if pillButton(c.Key("together-copy"), iconCopy, "复制邀请", p.accent, p.onAccent).Clicked() {
+			a.togetherCopyInvite()
+		}
 		label := "结束一起听"
 		if !st.host {
 			label = "离开一起听"
@@ -168,51 +279,87 @@ func (a *app) togetherTopBar(c *ui.Context) {
 		if pillButton(c.Key("together-leave"), iconSignOut, label, p.hover, p.text).Clicked() {
 			a.togetherLeaveRoom()
 		}
+	})
+	line, warn := a.togetherRoomNote()
+	if line == "" {
+		return
+	}
+	color := p.muted
+	if warn {
+		color = p.warn
+	}
+	// The room says what it has to say on its own line, as QQ 音乐 keeps its
+	// room description in the window: a popup over the record would only
+	// cover the song it is about.
+	ui.Row(c).Gap(6).AlignItems(ui.Center).Margin(-4, 2, 0, 2).Children(func() {
+		ui.Box(c).Size(5, 5).Radius(3).Background(color)
+		ui.Text(c, line).FontSize(11.5).TextColor(color).SingleLine()
+	})
+	if st.noteLive(time.Now()) {
+		// The line fades on its own, so redraw once when it is due to go.
+		a.togetherNoteWake(st.noteAt.Add(togetherNoteLife))
+	}
+}
 
-		if name := st.hostName(); name != "" {
-			ui.Text(c, name).FontSize(15).FontWeight(700).SingleLine().MaxWidth(220)
-		}
+// togetherRoomNote is the one line the room adds under its name: what the
+// room just did, why it is quiet, or that it is waiting. A room that is
+// simply playing says nothing.
+func (a *app) togetherRoomNote() (string, bool) {
+	st := &a.together
+	if st.noteLive(time.Now()) {
+		return st.note, st.noteWarn
+	}
+	switch {
+	case st.err != "":
+		return st.err, true
+	case st.status != together.StatusOnline:
+		return a.togetherStatusLine(), true
+	case len(st.members) <= 1:
+		return "等待好友加入中…把房间号发过去就能一起听", false
+	}
+	return "", false
+}
 
-		ui.Row(c).Height(28).PaddingX(10).Gap(8).Radius(999).AlignItems(ui.Center).Background(p.sidebar).Border(1, p.hairline).Children(func() {
-			ui.Text(c, "房间号").FontSize(10.5).FontWeight(600).TextColor(p.faint)
-			ui.Text(c, st.code).FontSize(12.5).FontWeight(700).LetterSpacing(1.6).TextColor(p.text)
-		})
-
-		if len(st.members) > 0 {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				for _, m := range st.members {
-					a.togetherMember(c, m)
-				}
-			})
+// togetherSyncPill says whether this client is where the room is: QQ 音乐
+// keeps a quiet indicator for it, and so does the room.
+func (a *app) togetherSyncPill(c *ui.Context) {
+	p := a.pal
+	st := &a.together
+	if st.playback == nil || st.playback.Track == nil || a.pl == nil {
+		return
+	}
+	if st.status != together.StatusOnline {
+		return
+	}
+	cur := a.pl.Current()
+	synced := cur != nil && cur.ID == st.playback.Track.ID && a.pl.Err() == ""
+	if synced && st.client != nil {
+		want := together.Expected(st.playback, st.client.ServerNow())
+		drift := a.pl.Position() - want
+		if drift < 0 {
+			drift = -drift
 		}
-
-		color := p.muted
-		line := a.togetherStatusLine()
-		if st.status == together.StatusOnline && st.err == "" && len(st.members) <= 1 {
-			line = "等待好友加入中…"
-		}
-		if st.status == together.StatusOnline && st.err == "" && len(st.members) > 1 {
-			color = p.accent
-			line = fmt.Sprintf("已连接 · %d 人在听", len(st.members))
-		}
-		ui.Text(c, line).FontSize(12).TextColor(color).SingleLine()
-
-		ui.Box(c).Grow(1)
-		if pillButton(c.Key("together-copy"), iconCopy, "复制邀请", p.hover, p.text).Clicked() {
-			a.togetherCopyInvite()
-		}
+		synced = drift <= together.DriftLimit
+	}
+	label, color := "同步中…", p.muted
+	if synced {
+		label, color = "已同步", p.accent
+	}
+	ui.Row(c).Height(24).PaddingX(9).Gap(6).Radius(999).AlignItems(ui.Center).Background(p.sidebar).Border(1, p.hairline).Children(func() {
+		ui.Box(c).Size(6, 6).Radius(3).Background(color)
+		ui.Text(c, label).FontSize(10.5).FontWeight(600).TextColor(color)
 	})
 }
 
 // togetherStage is the record and the song: the heart of the page.
 func (a *app) togetherStage(c *ui.Context) {
 	p := a.pal
-	ui.Box(c).Grow(1).Shrink(1).MinWidth(0).Padding(22).Radius(28).
+	ui.Box(c).Grow(1).Shrink(1).MinWidth(0).Padding(20).Radius(24).
 		LinearGradient(ui.LinearGradient{Angle: 150, Stops: []ui.GradientStop{
 			{Color: togetherCardTop(p.dark), At: 0},
 			{Color: togetherCardBottom(p.dark), At: 1},
-		}}).Border(1, p.hairline).Shadow(0, 18, 40, -20, p.cardShade).Children(func() {
-		ui.Row(c).Gap(26).AlignItems(ui.Center).Children(func() {
+		}}).Border(1, p.hairline).Shadow(0, 18, 40, -22, p.cardShade).Children(func() {
+		ui.Row(c).Gap(24).AlignItems(ui.Center).Children(func() {
 			a.togetherVinyl(c, togetherVinylSize(c))
 			a.togetherTrackInfo(c)
 		})
@@ -223,12 +370,12 @@ func (a *app) togetherStage(c *ui.Context) {
 // to hold it, the song and the two cards under it without a scroll.
 func togetherVinylSize(c *ui.Context) float32 {
 	w, h := c.Size()
-	size := float32(250)
+	size := float32(232)
 	if h >= 880 {
-		size = 300
+		size = 280
 	}
 	if w >= 1600 && h >= 940 {
-		size = 330
+		size = 312
 	}
 	return size
 }
@@ -241,13 +388,13 @@ func (a *app) togetherVinyl(c *ui.Context, size float32) {
 	var label *ui.Bitmap
 	playing := false
 	if st.playback != nil && st.playback.Track != nil {
-		label = bitmap(a.art.get(qqmusic.Sized(st.playback.Track.Album.PicURL, 400), artCover))
+		label = bitmap(a.art.get(qqmusic.Sized(togetherPic(st.playback.Track.Album.PicURL), 400), artCover))
 		playing = st.playback.Playing
 	}
 	card := ui.Box(c).Size(size, size).Shrink(0).Radius(size*0.09).
 		Background(togetherSleeve(p.dark)).Shadow(0, 18, 36, -14, p.cardShade)
 	card.Children(func() {
-		ui.Box(c).Absolute().Left(size*0.08).Top(size*0.08).Size(size*0.84, size*0.84).Radius(size*0.42).
+		ui.Box(c).Absolute().Left(size*0.08).Top(size*0.08).Size(size*0.84, size*0.84).Radius(size * 0.42).
 			PassThrough().Draw(func(pt *ui.Painter, r ui.Rect) {
 			spin := &a.togetherSpin
 			turn := float64(0)
@@ -280,28 +427,70 @@ func (a *app) togetherTrackInfo(c *ui.Context) {
 	pb := st.playback
 	ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(10).Children(func() {
 		if pb == nil || pb.Track == nil {
-			ui.Text(c, "等待一起听").FontSize(11.5).FontWeight(600).TextColor(p.muted).LetterSpacing(0.4)
-			ui.Text(c, "把房间号发给朋友，一起点一首歌").FontSize(26).FontWeight(700).LetterSpacing(-0.6).MaxLines(2)
-			ui.Text(c, "房间里的任何成员都能播放、暂停和切歌").FontSize(13).TextColor(p.muted).MaxLines(2)
+			ui.Text(c, "等待一起听").FontSize(11).FontWeight(700).TextColor(p.muted).LetterSpacing(0.6)
+			ui.Text(c, "把房间号发给朋友，一起点一首歌").FontSize(24).FontWeight(700).LetterSpacing(-0.5).MaxLines(2)
+			ui.Text(c, "谁都能播放、暂停，谁都能点歌").FontSize(12.5).TextColor(p.muted).MaxLines(2)
 			return
 		}
 		tr := qqmusicTrack(*pb.Track)
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, tr.Name).FontSize(29).FontWeight(750).LetterSpacing(-0.8).MaxLines(2)
+			ui.Text(c, tr.Name).FontSize(26).FontWeight(750).LetterSpacing(-0.6).MaxLines(2)
 			if pb.Track.Fee == 1 {
 				a.vipBadge(c)
 			}
 		})
-		ui.Text(c, tr.ArtistNames()).FontSize(14).TextColor(p.muted).SingleLine()
-		if tr.Album.Name != "" {
-			ui.Text(c, tr.Album.Name).FontSize(11.5).TextColor(p.faint).SingleLine()
-		}
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, tr.ArtistNames()).FontSize(13.5).TextColor(p.muted).SingleLine().Grow(1)
+			if tr.Album.Name != "" {
+				ui.Text(c, tr.Album.Name).FontSize(11).TextColor(p.faint).SingleLine().MaxWidth(220)
+			}
+		})
 		a.togetherLyricPreview(c, tr)
 		a.togetherTransport(c, tr)
-		if !st.host && playbackNeedsPermission(a.pl.Err()) {
+		switch {
+		case a.togetherUsingRoomStream(tr.ID):
+			// The room's membership is what plays here: say whose, as QQ
+			// 音乐 marks a song the room shares.
+			line := "音源来自房间里的会员"
+			if name := a.togetherStreamSource(tr.ID); name != "" {
+				line = "音源来自「" + name + "」的会员"
+			}
+			ui.Text(c, line).FontSize(11.5).TextColor(p.muted).MaxLines(2)
+		case a.pl.StreamTrial():
+			ui.Text(c, "只拿到试听片段：房间里没有能签这首歌的会员").FontSize(11.5).TextColor(p.muted).MaxLines(2)
+		case tr.Fee == 1 && a.pl.Loading() && len(st.members) > 1 && !a.togetherHasRoomStream(tr.ID):
+			ui.Text(c, "正在向房间里的会员要音源…").FontSize(11.5).TextColor(p.muted).MaxLines(2)
+		case !st.host && a.pl.Err() != "":
 			ui.Text(c, "你的账号可能需要 VIP；正在等房间里的会员分享音源").FontSize(11.5).TextColor(p.muted).MaxLines(2)
 		}
 	})
+}
+
+// togetherHasRoomStream reports whether the room holds a full link for a
+// track, whoever signed it.
+func (a *app) togetherHasRoomStream(id int64) bool {
+	s, ok := player.SharedStream(id)
+	return ok && s.URL != "" && !s.Trial
+}
+
+// togetherStreamSource is the member whose account signed the room's link
+// for a track.
+func (a *app) togetherStreamSource(id int64) string {
+	return a.together.streamFrom[id]
+}
+
+// togetherUsingRoomStream reports whether the room's link is what plays
+// this track here, so the page can say whose membership it is.
+func (a *app) togetherUsingRoomStream(id int64) bool {
+	if a.pl == nil || id == 0 {
+		return false
+	}
+	shared, ok := player.SharedStream(id)
+	if !ok || shared.URL == "" {
+		return false
+	}
+	local, ok := a.pl.StreamURL()
+	return ok && local.URL == shared.URL
 }
 
 // vipBadge marks a song QQ 音乐 keeps for members.
@@ -402,22 +591,29 @@ func (a *app) togetherProgress(c *ui.Context, tr qqmusic.Track) {
 	})
 }
 
-// togetherRequests is the song request desk: a search, what it found, and
-// what the room asked for. Any member may start a requested song.
-func (a *app) togetherRequests(c *ui.Context) {
+// togetherDesk is the room's desk: the songs anyone may ask for, or the
+// host's queue as the room plays it. QQ 音乐 keeps both on one card, with a
+// tab between them.
+func (a *app) togetherDesk(c *ui.Context) {
 	p := a.pal
 	st := &a.together
-	ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Padding(16).Gap(8).Radius(20).
+	ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Padding(14).Gap(8).Radius(18).
 		Background(p.sidebar).Border(1, p.hairline).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "点歌台").FontSize(15).FontWeight(700)
 			ui.Text(c, fmt.Sprintf("%d", len(st.pending))).FontSize(10.5).FontWeight(700).TextColor(p.muted).
 				PaddingX(7).Height(18).Radius(999).Center().Background(p.hover)
 			ui.Box(c).Grow(1)
-			ui.Text(c, "谁都能点，谁都能播").FontSize(10.5).TextColor(p.faint).SingleLine()
+			if segmented(c.Key("together-desk-tab"), &st.deskTab, "点歌", "队列") {
+				a.redraw()
+			}
 		})
+		if st.deskTab == 1 {
+			a.togetherQueue(c)
+			return
+		}
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-			in := ui.TextInput(c.Key("together-song"), &st.requestQuery).Placeholder("搜索歌曲，点歌到房间").FontSize(12.5).Grow(1).Height(32)
+			in := ui.TextInput(c.Key("together-song"), &st.requestQuery).Placeholder("搜一首歌，点给房间里的人").FontSize(12.5).Grow(1).Height(32)
 			if in.Submitted() {
 				a.togetherSearchSongs()
 			}
@@ -449,6 +645,103 @@ func (a *app) togetherRequests(c *ui.Context) {
 			})
 		})
 	})
+}
+
+// togetherQueue is the host's queue, mirrored: the same list the host plays
+// from, with the room's track marked. A guest sees it read-only, as QQ 音乐
+// keeps choosing songs with the host.
+func (a *app) togetherQueue(c *ui.Context) {
+	p := a.pal
+	st := &a.together
+	var tracks []together.Track
+	at := -1
+	if st.queue != nil && len(st.queue.Tracks) > 0 {
+		tracks = st.queue.Tracks
+		if st.playback != nil && st.playback.Track != nil {
+			for i, t := range tracks {
+				if t.ID == st.playback.Track.ID {
+					at = i
+					break
+				}
+			}
+		}
+	}
+	if len(tracks) == 0 {
+		ui.Text(c, "房主还没有队列").FontSize(12).TextColor(p.muted).Margin(6, 0, 0, 0)
+		ui.Box(c).Grow(1)
+		return
+	}
+	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, fmt.Sprintf("%d 首", len(tracks))).FontSize(10.5).TextColor(p.faint).SingleLine()
+		// The room's play mode is the room's, not this client's: QQ 音乐
+		// keeps playMode in the room, so both listeners walk the list the
+		// same way.
+		mode := "顺序播放"
+		if st.roomShuffle {
+			mode = "随机播放"
+		}
+		if st.host {
+			b := ui.Button(c.Key("together-shuffle"), mode).FontSize(10.5)
+			if st.roomShuffle {
+				b.TextColor(p.accent)
+			}
+			if b.Clicked() {
+				st.applying = true
+				a.pl.ToggleShuffle()
+				st.applying = false
+				a.togetherPublishQueue()
+				a.togetherPublish(true)
+				a.redraw()
+			}
+		} else {
+			ui.Text(c, mode).FontSize(10.5).TextColor(p.faint).SingleLine()
+		}
+		ui.Box(c).Grow(1)
+		ui.Text(c, "与房主同一个队列").FontSize(10.5).TextColor(p.faint).SingleLine()
+	})
+	ui.Scroll(c.Key("together-queue-body")).Grow(1).Children(func() {
+		ui.Column(c).Gap(2).Children(func() {
+			for i := range tracks {
+				a.togetherQueueRow(c, i, tracks[i], i == at)
+			}
+		})
+	})
+}
+
+func (a *app) togetherQueueRow(c *ui.Context, i int, t together.Track, current bool) {
+	p := a.pal
+	row := ui.Row(c).Height(40).PaddingX(6).Gap(8).Radius(8).AlignItems(ui.Center)
+	row.Children(func() {
+		if current {
+			ui.Icon(c, iconVolume).Size(12, 12).TextColor(p.accent)
+		} else {
+			ui.Text(c, fmt.Sprintf("%d", i+1)).FontSize(11).TextColor(p.faint).Width(12)
+		}
+		a.cover(c, togetherPic(t.Album.PicURL), 90, 30, 6)
+		ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(1).Children(func() {
+			name := ui.Text(c, t.Name).FontSize(12).FontWeight(600).SingleLine()
+			if current {
+				name.TextColor(p.accent)
+			}
+			ui.Text(c, togetherArtists(t)).FontSize(10.5).TextColor(p.muted).SingleLine()
+		})
+		if t.Fee == 1 {
+			ui.Text(c, "VIP").FontSize(9).FontWeight(800).TextColor(p.accent).
+				PaddingX(5).Height(15).Radius(999).Center().Background(p.accent.Alpha(0.14))
+		}
+	})
+	row.Background(row.AnimateColor("bg", ui.Transparent, ui.Animation{Duration: 120 * time.Millisecond}))
+	if row.Hovered() {
+		row.Background(row.AnimateColor("bg", p.hover, ui.Animation{Duration: 120 * time.Millisecond}))
+	}
+	if row.Clicked() {
+		// Only the host moves the queue; a guest asks through the desk.
+		if a.together.host {
+			a.togetherPlayQueueAt(i)
+		} else {
+			a.togetherNote("选歌由房主决定，可以点歌到点歌台")
+		}
+	}
 }
 
 // togetherSearchRow is one song a search found, with the button that asks
@@ -485,7 +778,7 @@ func (a *app) togetherRequestRow(c *ui.Context, i int, req together.Pending) {
 		if ui.Button(c.Key("together-play-"+req.ID), "播放").Clicked() {
 			a.togetherPlayPending(req)
 		}
-		if st.host || req.By == st.clientID {
+		if st.host || req.By == st.selfID {
 			iconButton(c.Key("together-drop-"+req.ID), iconX, 12, p.muted, "移除").OnClick(func() {
 				a.togetherRemovePending(req)
 			})
@@ -498,7 +791,7 @@ func (a *app) togetherRequestRow(c *ui.Context, i int, req together.Pending) {
 func (a *app) togetherChatCard(c *ui.Context) {
 	p := a.pal
 	st := &a.together
-	ui.Column(c).Grow(1).Shrink(1).MinWidth(0).MinHeight(210).Padding(14).Gap(8).Radius(20).
+	ui.Column(c).Grow(1).Shrink(1).MinWidth(0).MinHeight(200).Padding(14).Gap(8).Radius(18).
 		Background(p.sidebar).Border(1, p.hairline).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "聊天").FontSize(15).FontWeight(700)
@@ -511,7 +804,7 @@ func (a *app) togetherChatCard(c *ui.Context) {
 			ui.List(c, &st.chatList, len(st.chat), func(i int) { a.togetherChatLine(c, st.chat[i]) }).Grow(1)
 		}
 		ui.Row(c).Gap(2).Children(func() {
-			for _, emoji := range []string{"😀", "😂", "🥰", "👏", "🎵", "❤️", "🔥", "🌙"} {
+			for _, emoji := range []string{"😀", "🥰", "👏", "🎵", "❤️", "🌙"} {
 				b := roundButton(c.Key("together-emoji-"+emoji), 18, p.text, emoji)
 				b.Children(func() { ui.Text(c, emoji).FontSize(16) })
 				if b.Clicked() {
@@ -559,20 +852,35 @@ func (a *app) togetherMember(c *ui.Context, m together.Member) {
 		a.togetherAvatar(c, m.Avatar, m.Name, 20)
 		ui.Text(c, m.Name).FontSize(12).FontWeight(600).SingleLine().MaxWidth(110)
 		if m.Host {
+			ui.Icon(c, iconCrown).Size(11, 11).TextColor(p.accent)
 			ui.Text(c, "房主").FontSize(9.5).FontWeight(700).TextColor(p.accent).PaddingX(5).Height(16).Radius(999).Center().Background(p.accent.Alpha(0.12))
 		}
 	})
-	if a.together.host && m.Client != a.together.clientID {
-		chip.ContextMenu(func(menu *ui.Menu) {
-			if menu.Item("移出房间").Chosen() {
-				a.togetherKick(m)
-			}
-		})
+	if !a.together.host || m.Client == a.together.selfID {
+		return
 	}
+	chip.ContextMenu(func(menu *ui.Menu) {
+		// QQ 音乐 lets a host hand the room over; the queue and the
+		// transport go with it.
+		if a.together.hasFeature("transfer") && menu.Item("转让房主").Chosen() {
+			a.togetherTransferHost(m)
+		}
+		if menu.Item("移出房间").Chosen() {
+			a.togetherKick(m)
+		}
+	})
 }
 
 func (a *app) togetherChatLine(c *ui.Context, msg together.Chat) {
 	p := a.pal
+	if msg.System {
+		// The room's own lines sit in the middle, as QQ 音乐 shows who
+		// came, who left and who holds the room now.
+		ui.Box(c).Grow(1).Center().Padding(6, 0, 6, 0).Children(func() {
+			ui.Text(c, msg.Text).FontSize(10.5).TextColor(p.faint).MaxLines(2)
+		})
+		return
+	}
 	ui.Row(c).Gap(8).AlignItems(ui.Start).Padding(4, 0, 4, 0).Children(func() {
 		a.togetherAvatar(c, msg.Avatar, msg.Name, 22)
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
@@ -645,6 +953,27 @@ func togetherInitial(name string) string {
 // account may not play the track, as a guest without the room's membership.
 func playbackNeedsPermission(err string) bool {
 	return strings.Contains(err, "VIP") || strings.Contains(err, "会员") || strings.Contains(err, "购买") || strings.Contains(err, "权限")
+}
+
+// togetherPic keeps a cover a room sent to the hosts QQ Music serves
+// images from: an older relay does not filter them, and a client must not
+// be pointed at a host of a stranger's choosing.
+func togetherPic(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	ok := host == "qq.com" || strings.HasSuffix(host, ".qq.com") ||
+		host == "qlogo.cn" || strings.HasSuffix(host, ".qlogo.cn") ||
+		host == "gtimg.cn" || strings.HasSuffix(host, ".gtimg.cn")
+	if !ok {
+		return ""
+	}
+	return raw
 }
 
 // togetherArtists is the room track's artists' names, which has no
